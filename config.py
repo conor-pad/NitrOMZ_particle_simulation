@@ -11,7 +11,7 @@ Nx, Ny = int(331), int(287)
 
 dx = Lx / (Nx - 1)
 dy = Ly / (Ny - 1)
-Total_Time = 80
+Total_Time = 55
 
 # Particle Center
 cx = 5.0 * radius   # Positioned 5 radii from the left wall

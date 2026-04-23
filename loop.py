@@ -76,8 +76,14 @@ def run_simulation(state, cfg, device):
         v_full[1:-1, :] = -(psi_tot[2:, :] - psi_tot[:-2, :]) * state['inv_2dx']
 
         # ── Snapshots ────────────────────────────────────────────────────────
-        if n % snapshot_interval == 0:
-            # We extract just the 'o2' and 'n2o' tensors to pass to plotting.py
+        # 1. RAM Fix: Only save the very last frame if running the suite
+        if getattr(cfg, 'is_suite', False):
+            take_snapshot = (n == n_steps - 1)
+        else:
+            take_snapshot = (n % snapshot_interval == 0)
+
+        if take_snapshot:
+            # We extract the tensors to pass to plotting.py
             c_snapshots.append(tracers['o2'].cpu().numpy().astype(np.float32))
             n2o_snapshots.append(tracers['n2o'].cpu().numpy().astype(np.float32))
             no3_snapshots.append(tracers['no3'].cpu().numpy().astype(np.float32))
@@ -91,7 +97,8 @@ def run_simulation(state, cfg, device):
             v_snapshots.append(v_full.cpu().numpy().astype(np.float32))
             snapshot_times.append(current_time)
 
-            # Crucial for M2 memory stability
+        # 2. Garbage Collection Fix: Run this independently of the snapshots!
+        if n % 1000 == 0:
             torch.mps.empty_cache()
 
             # bar()
