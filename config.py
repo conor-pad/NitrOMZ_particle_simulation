@@ -11,7 +11,7 @@ Nx, Ny = int(331), int(287)
 
 dx = Lx / (Nx - 1)
 dy = Ly / (Ny - 1)
-Total_Time = 55
+Total_Time = 25
 
 # Particle Center
 cx = 5.0 * radius   # Positioned 5 radii from the left wall
@@ -50,8 +50,3 @@ print(f"────────────────────────
 # ── Time Stepping ─────────────────────────────────────────────────────────────
 target_CFL = 0.2
 
-
-# ── Steady State Optimization ─────────────────────────────────────────────────
-freeze_flow = True         # Toggle on or off
-flow_tolerance = 4e-4      # The threshold for steady state 
-min_flow_steps = 100

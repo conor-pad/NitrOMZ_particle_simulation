@@ -21,9 +21,12 @@ def run_simulation(state, cfg, device):
     w_snapshots, c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, nh4_snapshots, doc_snapshots = [], [], [], [], [], [], [], []
     u_snapshots, v_snapshots = [], []
     snapshot_times = []
+    
+    # ADDED: Initialize the empty lists for your new trackers
+    n2o_ammox_snapshots, n2o_denit_snapshots = [], []
 
     n_steps = int(cfg.Total_Time / dt)
-    snapshot_interval = max(1, int(0.015 / dt))
+    snapshot_interval = max(1, int(0.03 / dt))
 
     print(f"Total steps: {n_steps}  |  Snapshot every {snapshot_interval} steps")
     print("Starting 8-Tracer SSP-RK3 Loop on M2 GPU...")
@@ -36,7 +39,7 @@ def run_simulation(state, cfg, device):
                   unit="steps",
                   bar_format='{desc}: {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'):
 
-    # with alive_bar(n_steps, title="Simulating..", bar="smooth", spinner="waves", length=40) as bar:
+        # with alive_bar(n_steps, title="Simulating..", bar="smooth", spinner="waves", length=40) as bar:
     
         # for n in range(n_steps): # remove if using tqdm, indent everything back 1.
 
@@ -86,6 +89,9 @@ def run_simulation(state, cfg, device):
             # We extract the tensors to pass to plotting.py
             c_snapshots.append(tracers['o2'].cpu().numpy().astype(np.float32))
             n2o_snapshots.append(tracers['n2o'].cpu().numpy().astype(np.float32))
+            n2o_ammox_snapshots.append(tracers['n2o_ammox'].cpu().numpy().astype(np.float32))
+            n2o_denit_snapshots.append(tracers['n2o_denit'].cpu().numpy().astype(np.float32))
+
             no3_snapshots.append(tracers['no3'].cpu().numpy().astype(np.float32))
             no2_snapshots.append(tracers['no2'].cpu().numpy().astype(np.float32))
             n2_snapshots.append(tracers['n2'].cpu().numpy().astype(np.float32))
@@ -106,4 +112,5 @@ def run_simulation(state, cfg, device):
     total_elapsed = _time.perf_counter() - _loop_start
     print(f"\nSimulation complete in {total_elapsed:.1f}s. Generating animations...")
 
-    return c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, doc_snapshots, nh4_snapshots, w_snapshots, u_snapshots, v_snapshots, snapshot_times
+    # ADDED: Tacked the two new tracers onto the VERY END so it doesn't break index 0-10!
+    return c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, doc_snapshots, nh4_snapshots, w_snapshots, u_snapshots, v_snapshots, snapshot_times, n2o_ammox_snapshots, n2o_denit_snapshots

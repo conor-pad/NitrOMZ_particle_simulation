@@ -6,7 +6,8 @@ from matplotlib.patches import Circle
 from tqdm import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, doc_snapshots, nh4_snapshots, w_snapshots, u_snapshots, v_snapshots, snapshot_times, cfg):
+# UPDATED SIGNATURE: Added n2o_ammox_snapshots and n2o_denit_snapshots right before cfg
+def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, doc_snapshots, nh4_snapshots, w_snapshots, u_snapshots, v_snapshots, snapshot_times, n2o_ammox_snapshots, n2o_denit_snapshots, cfg):
     x = np.linspace(0, cfg.Lx, cfg.Nx)
     y = np.linspace(0, cfg.Ly, cfg.Ny)
     X, Y = np.meshgrid(x, y, indexing='ij')
@@ -37,12 +38,22 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
     doc_min, doc_max = get_bounds(doc_snapshots)
     nh4_min, nh4_max = get_bounds(nh4_snapshots)
 
-# ── 2D Animation (4 rows, 2 columns) ────────────────────────────────────────
+    # Custom bounds for the new N2O sources (forcing minimum to 0)
+    n2o_ammox_max = np.max(n2o_ammox_snapshots)
+    if n2o_ammox_max < 1e-5: n2o_ammox_max = 0.01
+    
+    n2o_denit_max = np.max(n2o_denit_snapshots)
+    if n2o_denit_max < 1e-5: n2o_denit_max = 0.01
+
+# ── 2D Animation (5 rows, 2 columns) ────────────────────────────────────────
     plt.rcParams['animation.embed_limit'] = 250
     
-    fig, axes = plt.subplots(4, 2, figsize=(15, 8.75), sharex=True, sharey=True)
+    # Proportional height scaling: 8.75 * (5/4) = 10.9375
+    fig, axes = plt.subplots(5, 2, figsize=(15, 10.9375), sharex=True, sharey=True)
     axes_flat = axes.flatten()
-    ax_vel, ax_o2, ax_no3, ax_no2, ax_n2o, ax_n2, ax_doc, ax_nh4 = axes_flat
+    
+    # Unpack the 10 axes
+    ax_vel, ax_o2, ax_no3, ax_no2, ax_n2o, ax_n2, ax_doc, ax_nh4, ax_n2o_ammox, ax_n2o_denit = axes_flat
 
     # CALCULATE ZOOM
     zoom_y_min = max(0, cfg.cy - 2.5 * cfg.radius)
@@ -64,7 +75,7 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
     add_perfect_colorbar(im_vel, ax_vel, 'Speed (mm/s)')
     Q = ax_vel.quiver(X[::skip, ::skip], Y[::skip, ::skip],
                       u_snapshots[0][::skip, ::skip], v_snapshots[0][::skip, ::skip],
-                      color='white', scale=cfg.U_bg * 40, alpha=0.8) # scale was 70 before.
+                      color='white', scale=cfg.U_bg * 40, alpha=0.8)
     ax_vel.set_title("Velocity", fontweight='bold')
 
     # O2 Plot
@@ -85,7 +96,7 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
     # 5. N2O Plot 
     im_n2o = ax_n2o.imshow(n2o_snapshots[0].T, origin='lower', extent=[0, cfg.Lx, 0, cfg.Ly], cmap='magma', vmin=n2o_min, vmax=n2o_max)
     add_perfect_colorbar(im_n2o, ax_n2o, 'N2O Concentration')
-    ax_n2o.set_title("N2O", fontweight='bold')
+    ax_n2o.set_title("Total N2O", fontweight='bold')
 
     # 6. N2 Plot 
     im_n2 = ax_n2.imshow(n2_snapshots[0].T, origin='lower', extent=[0, cfg.Lx, 0, cfg.Ly], cmap='magma', vmin=n2_min, vmax=n2_max)
@@ -101,6 +112,16 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
     im_nh4 = ax_nh4.imshow(nh4_snapshots[0].T, origin='lower', extent=[0, cfg.Lx, 0, cfg.Ly], cmap='magma', vmin=nh4_min, vmax=nh4_max)
     add_perfect_colorbar(im_nh4, ax_nh4, 'NH4 Concentration')
     ax_nh4.set_title("NH4", fontweight='bold')
+
+    # 9. N2O Ammox Plot
+    im_n2o_ammox = ax_n2o_ammox.imshow(n2o_ammox_snapshots[0].T, origin='lower', extent=[0, cfg.Lx, 0, cfg.Ly], cmap='magma', vmin=0, vmax=n2o_ammox_max)
+    add_perfect_colorbar(im_n2o_ammox, ax_n2o_ammox, 'N2O (Ammox)')
+    ax_n2o_ammox.set_title("N2O from Ammonia Oxidation", fontweight='bold')
+
+    # 10. N2O Denit Plot
+    im_n2o_denit = ax_n2o_denit.imshow(n2o_denit_snapshots[0].T, origin='lower', extent=[0, cfg.Lx, 0, cfg.Ly], cmap='magma', vmin=0, vmax=n2o_denit_max)
+    add_perfect_colorbar(im_n2o_denit, ax_n2o_denit, 'N2O (Denit)')
+    ax_n2o_denit.set_title("N2O from Denitrification", fontweight='bold')
 
 # ── Titles and Parameter Printout ───────────────────────────────────────────
     global_title = fig.suptitle("Time: 0.00", fontsize=18, fontweight='bold', y=0.98)
@@ -126,6 +147,7 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
 
     # Force the vertical space to be tiny and leave room at the top for the bigger box
     plt.subplots_adjust(top=0.84, bottom=0.05, left=0.05, right=0.95, hspace=0.15, wspace=0.1)
+    
     def update(frame_idx):
         speed = np.sqrt(u_snapshots[frame_idx]**2 + v_snapshots[frame_idx]**2)
         im_vel.set_data(speed.T)
@@ -138,9 +160,13 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
         im_n2.set_data(n2_snapshots[frame_idx].T)
         im_doc.set_data(doc_snapshots[frame_idx].T)
         im_nh4.set_data(nh4_snapshots[frame_idx].T)
+        
+        # Update the two new arrays
+        im_n2o_ammox.set_data(n2o_ammox_snapshots[frame_idx].T)
+        im_n2o_denit.set_data(n2o_denit_snapshots[frame_idx].T)
 
         global_title.set_text(f"Time: {snapshot_times[frame_idx]:.2f}")
-        return [im_vel, Q, im_o2, im_no3, im_no2, im_n2o, im_n2, im_doc, im_nh4] 
+        return [im_vel, Q, im_o2, im_no3, im_no2, im_n2o, im_n2, im_doc, im_nh4, im_n2o_ammox, im_n2o_denit] 
 
     anim = animation.FuncAnimation(fig, update, frames=len(c_snapshots), interval=15, blit=False)
 
@@ -164,14 +190,15 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
 
     #############
 
-    # ── 1D Cross-Section Animation ────────────────────────────────────────────────
+# ── 1D Cross-Section Animation ────────────────────────────────────────────────
     y_slice = cfg.cy;  idx_y = int(y_slice / cfg.dy)
 
-    fig_1d, axes_1d = plt.subplots(4, 2, figsize=(14, 10), sharex=True)
+    # Upgraded to 5x2 to fit the new tracers and scaled the height proportionally
+    fig_1d, axes_1d = plt.subplots(5, 2, figsize=(14, 12), sharex=True)
     axes_1d_flat = axes_1d.flatten()
 
-    titles = ["Velocity Speed", "O2", "NO3", "NO2", "N2O", "N2", "DOC", "NH4"]
-    colors = ['black', 'blue', 'green', 'orange', 'purple', 'red', 'darkgreen', 'magenta']
+    titles = ["Velocity Speed", "O2", "NO3", "NO2", "Total N2O", "N2", "DOC", "NH4", "N2O (Ammox)", "N2O (Denit)"]
+    colors = ['black', 'blue', 'green', 'orange', 'purple', 'red', 'darkgreen', 'magenta', 'teal', 'brown']
 
     speed_0 = np.sqrt(u_snapshots[0]**2 + v_snapshots[0]**2)
 
@@ -184,8 +211,14 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
     line_n2,  = axes_1d_flat[5].plot(x, n2_snapshots[0][:, idx_y], color=colors[5], lw=2)
     line_doc, = axes_1d_flat[6].plot(x, doc_snapshots[0][:, idx_y], color=colors[6], lw=2)
     line_nh4, = axes_1d_flat[7].plot(x, nh4_snapshots[0][:, idx_y], color=colors[7], lw=2)
-    lines = [line_vel, line_o2, line_no3, line_no2, line_n2o, line_n2, line_doc, line_nh4]
+    
+    # ADDED: The two new source lines
+    line_n2o_ammox, = axes_1d_flat[8].plot(x, n2o_ammox_snapshots[0][:, idx_y], color=colors[8], lw=2)
+    line_n2o_denit, = axes_1d_flat[9].plot(x, n2o_denit_snapshots[0][:, idx_y], color=colors[9], lw=2)
+    
+    lines = [line_vel, line_o2, line_no3, line_no2, line_n2o, line_n2, line_doc, line_nh4, line_n2o_ammox, line_n2o_denit]
 
+    # Added the bounds for the new sources (forcing minimum to 0)
     y_limits = [
         (0, cfg.U_bg * 3), 
         (max(0, o2_min - 0.05), o2_max + 0.05),
@@ -194,7 +227,9 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
         (max(0, n2o_min - 0.001), n2o_max + 0.001),
         (max(0, n2_min - 0.001), n2_max + 0.001),
         (max(0, doc_min - 1.0), doc_max + 1.0),
-        (max(0, nh4_min - 0.001), nh4_max + 0.001)
+        (max(0, nh4_min - 0.001), nh4_max + 0.001),
+        (0, n2o_ammox_max + 0.001), 
+        (0, n2o_denit_max + 0.001)  
     ]
 
     for i, ax in enumerate(axes_1d_flat):
@@ -208,12 +243,11 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
         if i == 0:
             ax.set_ylabel("Speed (mm/s)")
             ax.legend(loc='upper right', fontsize=8)
-        if i >= 6:
+        if i >= 8:  # Adjusted so only the bottom two plots get the X-axis label
             ax.set_xlabel("X coordinate")
 
     title_1d = fig_1d.suptitle("Horizontal Cross-Section — Time: 0.00", fontsize=16, fontweight='bold', y=0.98)
     
-    # Also print the parameters on the 1D cross-section plot
     fig_1d.text(0.5, 0.94, param_str, ha='center', va='top', fontsize=10, 
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, edgecolor='gray'))
                 
@@ -229,6 +263,10 @@ def generate_plots(c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_
         lines[5].set_ydata(n2_snapshots[frame_idx][:, idx_y])
         lines[6].set_ydata(doc_snapshots[frame_idx][:, idx_y])
         lines[7].set_ydata(nh4_snapshots[frame_idx][:, idx_y])
+        
+        # ADDED: Update the new tracer lines for each frame
+        lines[8].set_ydata(n2o_ammox_snapshots[frame_idx][:, idx_y])
+        lines[9].set_ydata(n2o_denit_snapshots[frame_idx][:, idx_y])
         
         title_1d.set_text(f"Horizontal Cross-Section — Time: {snapshot_times[frame_idx]:.2f}")
         return lines

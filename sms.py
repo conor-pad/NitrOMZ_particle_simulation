@@ -86,6 +86,10 @@ def nit_sms_omz(var_dict, bgc):
     # N2O total SMS
     ddt['n2o'] = sms_n2o_ammox + sms_n2o_nden + sms_n2o_den2 + sms_n2o_den3
 
+    # Add the newly tracked separate source terms
+    ddt['n2o_ammox'] = sms_n2o_ammox + sms_n2o_nden
+    ddt['n2o_denit'] = sms_n2o_den2 + sms_n2o_den3
+
     # ── Wraps diagnostics ──
     diags = {}
     diags['NRemOx']   = bgc.NCrem * RemOx
@@ -98,5 +102,12 @@ def nit_sms_omz(var_dict, bgc):
     diags['Jnn2o_Ax'] = Jnn2o_hx + Jnn2o_nden
     diags['Jno2_Ax']  = Jno2_hx + Jno2_nden
     diags['Anammox']  = 2.0 * Anammox
+
+    # same things as above, but this time kept in CARBON UNITS
+    diags['RemOx_C']   = RemOx
+    diags['RemDen1_C'] = RemDen1
+    diags['RemDen2_C'] = RemDen2
+    diags['RemDen3_C'] = RemDen3
+
 
     return ddt, diags

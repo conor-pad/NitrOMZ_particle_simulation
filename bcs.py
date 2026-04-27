@@ -17,6 +17,8 @@ class InflowBCs:
 
     po4: float = 0.0
     n2o: float = 0.0
+    n2o_ammox: float = 0.0
+    n2o_denit: float = 0.0
     nh4: float = 0.0
     no2: float = 0.0
     n2:  float = 0.0

@@ -27,7 +27,7 @@ def setup_physics(cfg):
     drag_mask_np = np.zeros_like(X)
     particle_mask_np = np.zeros_like(X)
     particle_idx = (X - cfg.cx)**2 + (Y - cfg.cy)**2 <= cfg.radius**2
-    drag_mask_np[particle_idx] = 1500
+    drag_mask_np[particle_idx] = 500
     particle_mask_np[particle_idx] = 1.0
 
     max_alpha = np.max(drag_mask_np)
@@ -44,8 +44,9 @@ def setup_physics(cfg):
     dt_visc = 0.25 * min(cfg.dx, cfg.dy)**2 / cfg.nu
 
     # Take the absolute smallest required time step!
-    dt = min(dt_adv, dt_drag, dt_diff, dt_visc)
-    print(f"Time step: {dt:.6f}  (was {0.05 * min(cfg.dx, cfg.dy) / cfg.U_bg:.6f} at CFL=0.05)")
+    dt, min_name = min((dt_adv, "dt_adv"), (dt_drag, "dt_drag"), (dt_diff, "dt_diff"), (dt_visc, "dt_visc"))
+
+    print(f"Time step: {dt:.6f} (Source: {min_name})")
     # store so it can be put onto the plot
     cfg.dt = dt          
     cfg.drag_max = 1500
@@ -63,7 +64,8 @@ def setup_physics(cfg):
     state['bgc'] = BioPar()
     
     # Tracer names for easy looping
-    tracer_names = ['o2', 'no3', 'doc', 'po4', 'n2o', 'nh4', 'no2', 'n2']
+    # tracer_names = ['o2', 'no3', 'doc', 'po4', 'n2o', 'nh4', 'no2', 'n2']
+    tracer_names = ['o2', 'no3', 'doc', 'po4', 'n2o', 'n2o_ammox', 'n2o_denit', 'nh4', 'no2', 'n2']
     
     state['tracer_names'] = tracer_names
     
