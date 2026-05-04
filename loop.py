@@ -109,6 +109,25 @@ def run_simulation(state, cfg, device):
 
             # bar()
 
+        # ── 3. SAFETY KILL SWITCH ──
+        # Check for NaNs/Infs every 100 steps (prevents GPU sync bottleneck)
+        if n % 100 == 0:
+            # 1. Check fluid momentum
+            if not torch.isfinite(w).all().item():
+                print(f"\n🚨 FATAL ERROR: NaN or Inf detected in fluid vorticity (w) at step {n} (time = {current_time:.3f}s)!")
+                break # Kills the loop
+            
+            # 2. Check all biological tracers
+            tracer_crashed = False
+            for name, tensor in tracers.items():
+                if not torch.isfinite(tensor).all().item():
+                    print(f"\n🚨 FATAL ERROR: NaN or Inf detected in tracer '{name}' at step {n} (time = {current_time:.3f}s)!")
+                    tracer_crashed = True
+                    break
+            
+            if tracer_crashed:
+                break # Kills the outer loop
+
     total_elapsed = _time.perf_counter() - _loop_start
     print(f"\nSimulation complete in {total_elapsed:.1f}s. Generating animations...")
 

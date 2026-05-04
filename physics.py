@@ -23,14 +23,21 @@ def setup_physics(cfg):
 
     psi_bg_np = cfg.U_bg * Y
 
+    # Calculate the advective timescale across one grid cell
+    t_adv_cell = min(cfg.dx, cfg.dy) / cfg.U_bg
+    
+    # Analytically scale alpha to be exactly 30x stronger than advection
+    max_alpha = 30.0 / t_adv_cell
+    cfg.drag_max = max_alpha
+
     # Circular Particle (Drag Mask)
     drag_mask_np = np.zeros_like(X)
     particle_mask_np = np.zeros_like(X)
     particle_idx = (X - cfg.cx)**2 + (Y - cfg.cy)**2 <= cfg.radius**2
-    drag_mask_np[particle_idx] = 500
+    
+    drag_mask_np[particle_idx] = max_alpha
     particle_mask_np[particle_idx] = 1.0
 
-    max_alpha = np.max(drag_mask_np)
     # 1. Advective limit (How fast the fluid moves)
     dt_adv  = cfg.target_CFL * min(cfg.dx, cfg.dy) / cfg.U_bg
     
@@ -44,16 +51,16 @@ def setup_physics(cfg):
     dt_visc = 0.25 * min(cfg.dx, cfg.dy)**2 / cfg.nu
 
     # Take the absolute smallest required time step!
+    # Notice: The 0.0004 band-aid is gone! The analytical drag limit protects us now.
     dt, min_name = min((dt_adv, "dt_adv"), (dt_drag, "dt_drag"), (dt_diff, "dt_diff"), (dt_visc, "dt_visc"))
 
     print(f"Time step: {dt:.6f} (Source: {min_name})")
     # store so it can be put onto the plot
-    cfg.dt = dt          
-    cfg.drag_max = 1500
+    cfg.dt = dt
 
     
 
-    drag_mask_np = gaussian_filter(drag_mask_np, sigma=1.0)
+    drag_mask_np = gaussian_filter(drag_mask_np, sigma=1.5)
     da_dx_np, da_dy_np = np.gradient(drag_mask_np, cfg.dx, cfg.dy)
 
     # Dictionary to hold all dynamic tensor states
@@ -158,7 +165,7 @@ def get_psi_pert(w_field, state):
 
 
 def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
-    """Batched RHS for vorticity and all 8 tracers simultaneously."""
+    """Batched RHS for vorticity (Arakawa) and 8 tracers (Upwind) simultaneously."""
     p = streamfunction
 
     p_e  = p[2:,   1:-1];  p_w  = p[:-2,  1:-1]
@@ -181,64 +188,79 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
     f_w_list  = [w_f[:-2,  1:-1]] + [tracers_dict[name][:-2,  1:-1] for name in tracer_names]
     f_n_list  = [w_f[1:-1, 2:  ]] + [tracers_dict[name][1:-1, 2:  ] for name in tracer_names]
     f_s_list  = [w_f[1:-1, :-2 ]] + [tracers_dict[name][1:-1, :-2 ] for name in tracer_names]
-    f_ne_list = [w_f[2:,   2:  ]] + [tracers_dict[name][2:,   2:  ] for name in tracer_names]
-    f_sw_list = [w_f[:-2,  :-2 ]] + [tracers_dict[name][:-2,  :-2 ] for name in tracer_names]
-    f_se_list = [w_f[2:,   :-2 ]] + [tracers_dict[name][2:,   :-2 ] for name in tracer_names]
-    f_nw_list = [w_f[:-2,  2:  ]] + [tracers_dict[name][:-2,  2:  ] for name in tracer_names]
+    
+    # We only need the corners for the Arakawa vorticity scheme, not the tracers
+    f_ne_list = [w_f[2:,   2:  ]] 
+    f_sw_list = [w_f[:-2,  :-2 ]] 
+    f_se_list = [w_f[2:,   :-2 ]] 
+    f_nw_list = [w_f[:-2,  2:  ]] 
 
     f_c  = torch.stack(f_c_list)
     f_e  = torch.stack(f_e_list)
     f_w  = torch.stack(f_w_list)
     f_n  = torch.stack(f_n_list)
     f_s  = torch.stack(f_s_list)
-    f_ne = torch.stack(f_ne_list)
-    f_sw = torch.stack(f_sw_list)
-    f_se = torch.stack(f_se_list)
-    f_nw = torch.stack(f_nw_list)
+    
+    # Isolate just the vorticity field (index 0) for Arakawa
+    w_c, w_e, w_w, w_n, w_s = f_c[0], f_e[0], f_w[0], f_n[0], f_s[0]
+    w_ne, w_sw = f_ne_list[0], f_sw_list[0]
+    w_se, w_nw = f_se_list[0], f_nw_list[0]
 
-    # ── Arakawa Jacobian & Laplacian ──
-    J_std   = (dp_ew * (f_n - f_s) - dp_ns * (f_e - f_w)) * state['inv_4dxdy']
-    J_hat   = (p_e  * (f_ne - f_se) - p_w  * (f_nw - f_sw)
-             - p_n  * (f_ne - f_nw) + p_s  * (f_se - f_sw)) * state['inv_4dxdy']
-    J_tilde = (f_n  * dp_ne_nw - f_s  * dp_se_sw
-             - f_e  * dp_ne_se + f_w  * dp_nw_sw) * state['inv_4dxdy']
+    # ── 1. Fluid Momentum: Arakawa Jacobian ──
+    J_std   = (dp_ew * (w_n - w_s) - dp_ns * (w_e - w_w)) * state['inv_4dxdy']
+    J_hat   = (p_e  * (w_ne - w_se) - p_w  * (w_nw - w_sw)
+             - p_n  * (w_ne - w_nw) + p_s  * (w_se - w_sw)) * state['inv_4dxdy']
+    J_tilde = (w_n  * dp_ne_nw - w_s  * dp_se_sw
+             - w_e  * dp_ne_se + w_w  * dp_nw_sw) * state['inv_4dxdy']
     
     J_avg = (J_std + J_hat + J_tilde) / 3.0 
-    lap   = (f_e + f_w - 2.0 * f_c) * state['inv_dx2'] + (f_n + f_s - 2.0 * f_c) * state['inv_dy2']
+    
+    # Standard Central Diffusion (Laplacian) applies to EVERYTHING
+    lap = (f_e + f_w - 2.0 * f_c) * state['inv_dx2'] + (f_n + f_s - 2.0 * f_c) * state['inv_dy2']
 
-    # ── Masks ──
+    # ── 2. Calculate Local Velocities ──
+    u_c   = dp_ns * state['inv_2dy']
+    v_c   = -dp_ew * state['inv_2dx']
+
+    # ── Vorticity Drag & Final RHS ──
     dm  = state['drag_mask'][1:-1, 1:-1]
     dax = state['da_dx'][1:-1, 1:-1]
     day = state['da_dy'][1:-1, 1:-1]
-
-    # ── Vorticity RHS ──
-    u_c   = dp_ns * state['inv_2dy']
-    v_c   = -dp_ew * state['inv_2dx']
-    drag  = dm * f_c[0] - (day * u_c - dax * v_c)
     
-    rhs_w = J_avg[0] + cfg.nu * lap[0] - drag
+    drag  = dm * w_c - (day * u_c - dax * v_c)
+    rhs_w = J_avg + cfg.nu * lap[0] - drag
     state['_rhs_buf_w'][1:-1, 1:-1] = rhs_w
 
-    # ── Biogeochemistry SMS Terms ──
-    interior_tracers = {name: tracers_dict[name][1:-1, 1:-1] for name in tracer_names}
+    # ── 3. Tracer Advection: 1st-Order Upwind Scheme ──
+    # Isolate just the stacked tracers (indices 1 through 8)
+    t_c, t_e, t_w, t_n, t_s = f_c[1:], f_e[1:], f_w[1:], f_n[1:], f_s[1:]
     
-    # Calculate biological source/sink rates (ddt)
+    # Broadcast velocities so they can multiply the entire stack of 8 tracers at once
+    u_vel = u_c.unsqueeze(0)
+    v_vel = v_c.unsqueeze(0)
+    
+    # Upwind Logic: Look left if moving right, look right if moving left
+    adv_x = torch.where(u_vel > 0, u_vel * (t_c - t_w) / cfg.dx, u_vel * (t_e - t_c) / cfg.dx)
+    adv_y = torch.where(v_vel > 0, v_vel * (t_c - t_s) / cfg.dy, v_vel * (t_n - t_c) / cfg.dy)
+    
+    # The advective flux leaving the cell
+    tracer_advection = -(adv_x + adv_y)
+
+    # ── 4. Biogeochemistry SMS Terms ──
+    interior_tracers = {name: tracers_dict[name][1:-1, 1:-1] for name in tracer_names}
     ddt, _ = nit_sms_omz(interior_tracers, state['bgc'])
 
-    # ── Tracers RHS ──
+    # ── Tracers Final RHS ──
     for i, name in enumerate(tracer_names):
         
-        # Base physics: Advection + Diffusion + Microbial Consumption (for ALL tracers)
-        rhs_t = J_avg[i+1] + cfg.K * lap[i+1] + ddt[name]
+        # Upwind Advection + Central Diffusion + Microbial Consumption
+        rhs_t = tracer_advection[i] + cfg.K * lap[i+1] + ddt[name]
         
-        # Add the POC-to-DOC flux!
+        # Add the POC-to-DOC flux
         if name == 'doc':
             flux_rate = getattr(cfg, 'doc_flux_rate', 0.0) 
-            
-            # Multiply by the mask so the flux ONLY happens inside the white circle
             rhs_t += flux_rate * state['particle_mask'][1:-1, 1:-1]
             
-        # 3. Save to the GPU buffer
         state['_rhs_tracers'][name][1:-1, 1:-1] = rhs_t
 
     return state['_rhs_buf_w'], state['_rhs_tracers']
