@@ -59,3 +59,35 @@ def apply_bcs(w_f, tracers_dict):
         
     return w_f, tracers_dict
 
+
+def enforce_symmetry(w, tracers, tracer_names):
+    """
+    Projects solution onto symmetric subspace each step.
+    - Vorticity: odd (antisymmetric) about horizontal midline
+    - Tracers:   even (symmetric)  about horizontal midline
+    Ny=287 is odd, so index 143 is exactly the midline.
+    """
+    Ny  = w.shape[1]
+    mid = Ny // 2  # = 143 for Ny=287
+
+    # ── Vorticity (antisymmetric: w_top = -w_bot_mirrored) ──
+    w_top    = w[:, mid + 1:]          # shape (Nx, 143)
+    w_bot    = w[:, :mid].flip(dims=[1])  # flipped to align with top
+
+    w_sym = (w_top - w_bot) * 0.5     # antisymmetric average
+    w[:, mid + 1:] =  w_sym
+    w[:, :mid]     = -w_sym.flip(dims=[1])
+    w[:, mid]      =  0.0             # midline must be zero for odd field
+
+    # ── Tracers (symmetric: c_top = c_bot_mirrored) ──
+    for name in tracer_names:
+        t     = tracers[name]
+        t_top = t[:, mid + 1:]
+        t_bot = t[:, :mid].flip(dims=[1])
+
+        t_sym = (t_top + t_bot) * 0.5
+        t[:, mid + 1:] = t_sym
+        t[:, :mid]     = t_sym.flip(dims=[1])
+        # midline is self-consistent for even fields; no change needed
+
+    return w, tracers

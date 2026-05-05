@@ -2,6 +2,7 @@
 import os
 import sys
 import torch
+torch.set_default_dtype(torch.float32)
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -28,7 +29,7 @@ def run_experiment(radius, ext_o2, ext_no3):
     
     # ── 1. Update Geometry & Speed ──
     cfg.radius = radius
-    cfg.U_bg = 2.2 * (radius / 1.0)**0.3
+    cfg.U_bg = 2.2 * (radius / 1.0)**0.56
     
     cfg.Lx = 20.0 * radius
     cfg.Ly = 10.0 * radius
@@ -45,7 +46,7 @@ def run_experiment(radius, ext_o2, ext_no3):
     # ── 3. NEW: Recalculate Dimensionless Physics Dynamically ──
     cfg.Re_actual = (cfg.U_bg * (2.0 * radius)) / cfg.nu
     cfg.Sh = 1 + 0.619 * (cfg.Re_actual ** 0.412) * (cfg.Sc_target ** (1/3))
-
+    tqdm.write(f"▶ Simulating | R: {cfg.radius:.2f} mm | U: {cfg.U_bg:.2f} mm/s | Re: {cfg.Re_actual:.2f} | Time: {cfg.Total_Time:.1f}s")
     bcs.inflow.o2 = ext_o2
     bcs.inflow.no3 = ext_no3
 
@@ -197,18 +198,29 @@ def generate_all_plots(csv_filename):
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
     plt.rcParams.update({'font.weight': 'bold', 'axes.labelweight': 'bold'})
 
-    # ── PLOT 1: Normalized N2O Flux ──
+    # ── DYNAMIC BASELINE SELECTION ──
+    available_no3 = df['Ext_NO3'].unique()
+    available_o2 = df['Ext_O2'].unique()
+    
+    # If there's only 1 value, it forces it. If multiple, it prefers 10.0/6.0, or falls back to index 0.
+    base_no3 = available_no3[0] if len(available_no3) == 1 else (10.0 if 10.0 in available_no3 else available_no3[0])
+    base_o2 = available_o2[0] if len(available_o2) == 1 else (6.0 if 6.0 in available_o2 else available_o2[0])
+    
+    print(f"\n📊 Plotting Baselines Auto-Selected -> O2: {base_o2}, NO3: {base_no3}")
+
+    # ── PLOT 1: Normalized N2O Yield (Whole Domain) ──
     g1 = sns.FacetGrid(df, col="Radius_mm", hue="Ext_NO3", palette="magma", height=4.5, aspect=1.2, sharey=False)
     g1.map(sns.lineplot, "Ext_O2", "N2O_Yield_per_C", marker="o", linewidth=2.5, markersize=8)
-    g1.set_axis_labels("Ambient O2 (mmol/m3)", "N2O Yield (mmol N2O / mmol C metabolized)")
+    g1.set_axis_labels("Ambient O2 (mmol/m3)", "Total Domain N2O Yield\n(mmol N2O / mmol Total C metabolized)")
     g1.set_titles(col_template="Particle Radius: {col_name} mm")
     g1.add_legend(title="Ambient NO3 (mmol/m3)", loc='upper center', bbox_to_anchor=(0.45, -0.15), ncol=3, frameon=True)
     plt.subplots_adjust(top=0.85, bottom=0.25)
-    g1.fig.suptitle("N2O Production Efficiency vs. Ambient O2 & NO3", fontsize=16, fontweight='bold', y=0.98)
+    g1.fig.suptitle("N2O Production Efficiency vs. Ambient O2 & NO3 (Core + Plume)", fontsize=16, fontweight='bold', y=0.98)
     plt.savefig(f"outputs/Plot1_N2O_Yield.png", dpi=300, bbox_inches='tight')
 
     # ── PLOTS 2 & 3: Metabolic Architecture (Core vs Plume) ──
-    df_base = df[(df['Ext_O2'] == 6.0) & (df['Ext_NO3'] == 10.0)].copy()
+    # Filtering dynamically based on the available data!
+    df_base = df[(df['Ext_O2'] == base_o2) & (df['Ext_NO3'] == base_no3)].copy()
 
     def get_melted_fractions(df_in, zone_suffix, x_var):
         cols = [f'Frac_Oxic_{zone_suffix}', f'Frac_Den1_{zone_suffix}', f'Frac_Den2_{zone_suffix}', f'Frac_Den3_{zone_suffix}']
@@ -222,15 +234,16 @@ def generate_all_plots(csv_filename):
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
     sns.lineplot(data=df_core_rad, x='Radius_mm', y='Fraction', hue='Pathway', marker="s", linewidth=2.5, ax=axes[0])
-    axes[0].set_title("Internal Core Metabolism", fontweight='bold')
+    axes[0].set_title("Inside Particle Only (Core Metabolism)", fontweight='bold')
     axes[0].set_xlabel("Particle Radius (mm)")
-    axes[0].set_ylabel("Fraction of DOC Consumed")
+    axes[0].set_ylabel("Fraction of DOC Consumed in Zone")
 
     sns.lineplot(data=df_plume_rad, x='Radius_mm', y='Fraction', hue='Pathway', marker="s", linewidth=2.5, ax=axes[1])
-    axes[1].set_title("Plume/Wake Metabolism", fontweight='bold')
+    axes[1].set_title("Outside Particle Only (Plume/Wake Metabolism)", fontweight='bold')
     axes[1].set_xlabel("Particle Radius (mm)")
 
-    plt.suptitle("Metabolic Partitioning vs. Particle Size (O2=6.0, NO3=10.0)", fontsize=16, fontweight='bold', y=1.02)
+    # Dynamic Title
+    plt.suptitle(f"Spatial Metabolic Partitioning vs. Particle Size (O2={base_o2}, NO3={base_no3})", fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig("outputs/Plot2_Metabolism_vs_Radius.png", dpi=300, bbox_inches='tight')
 
@@ -240,19 +253,20 @@ def generate_all_plots(csv_filename):
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
     sns.lineplot(data=df_core_vel, x='Speed_mms', y='Fraction', hue='Pathway', marker="^", linewidth=2.5, ax=axes[0])
-    axes[0].set_title("Internal Core Metabolism", fontweight='bold')
+    axes[0].set_title("Inside Particle Only (Core Metabolism)", fontweight='bold')
     axes[0].set_xlabel("Sinking Velocity (mm/s)")
-    axes[0].set_ylabel("Fraction of DOC Consumed")
+    axes[0].set_ylabel("Fraction of DOC Consumed in Zone")
 
     sns.lineplot(data=df_plume_vel, x='Speed_mms', y='Fraction', hue='Pathway', marker="^", linewidth=2.5, ax=axes[1])
-    axes[1].set_title("Plume/Wake Metabolism", fontweight='bold')
+    axes[1].set_title("Outside Particle Only (Plume/Wake Metabolism)", fontweight='bold')
     axes[1].set_xlabel("Sinking Velocity (mm/s)")
 
-    plt.suptitle("Metabolic Partitioning vs. Sinking Velocity (O2=6.0, NO3=10.0)", fontsize=16, fontweight='bold', y=1.02)
+    # Dynamic Title
+    plt.suptitle(f"Spatial Metabolic Partitioning vs. Sinking Velocity (O2={base_o2}, NO3={base_no3})", fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig("outputs/Plot3_Metabolism_vs_Velocity.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 4: Residence Times (15-Panel Grid) ──
+    # ── PLOT 4: Residence Times (Inside Core Only) ──
     tau_cols = ['Tau_o2', 'Tau_no3', 'Tau_n2o', 'Tau_n2', 'Tau_nh4']
     df_tau = df.melt(id_vars=['Radius_mm', 'Ext_O2', 'Ext_NO3'],
                      value_vars=tau_cols,
@@ -265,16 +279,14 @@ def generate_all_plots(csv_filename):
     
     g4.map(sns.lineplot, "Ext_O2", "Residence_Time_s", marker="o", linewidth=2.5)
     g4.add_legend(title="Ambient NO3 (mmol/m3)")
-    g4.set_axis_labels("Ambient O2 (mmol/m3)", "Internal Residence Time (s)")
+    g4.set_axis_labels("Ambient O2 (mmol/m3)", "Core Residence Time (s)")
     g4.set_titles(col_template="Radius: {col_name} mm", row_template="{row_name} Turnover")
     
     plt.subplots_adjust(top=0.92)
-    g4.fig.suptitle("Microenvironmental Residence Times vs. Ambient Forcing", fontsize=16, fontweight='bold')
+    g4.fig.suptitle("Internal Microenvironmental Residence Times vs. Ambient Forcing (Inside Particle Only)", fontsize=16, fontweight='bold')
     plt.savefig(f"outputs/Plot4_Residence_Times.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 5: N2O Source Apportionment (Internal vs Plume) ──
-    df_base = df[(df['Ext_O2'] == 6.0) & (df['Ext_NO3'] == 10.0)].copy()
-
+    # ── PLOT 5: N2O Source Apportionment (Inside vs Outside) ──
     df_plume = df_base.melt(id_vars=['Radius_mm', 'Speed_mms'], 
                             value_vars=['Plume_N2O_Ammox', 'Plume_N2O_Denit'],
                             var_name='Pathway', value_name='N2O Production (mmol/s)')
@@ -289,63 +301,63 @@ def generate_all_plots(csv_filename):
 
     sns.lineplot(data=df_plume, x='Radius_mm', y='N2O Production (mmol/s)', 
                  hue='Pathway', marker="X", linewidth=2.5, palette=['teal', 'darkred'], ax=axes[0])
-    axes[0].set_title("Plume/Wake N2O Sources", fontweight='bold')
+    axes[0].set_title("Outside Particle Only (Plume/Wake N2O Sources)", fontweight='bold')
     axes[0].set_xlabel("Particle Radius (mm)")
     axes[0].set_ylabel("N2O Production Rate (mmol/s)")
     axes[0].grid(True, linestyle='--', alpha=0.7)
 
     sns.lineplot(data=df_internal, x='Radius_mm', y='N2O Production (mmol/s)', 
                  hue='Pathway', marker="o", linewidth=2.5, palette=['teal', 'darkred'], ax=axes[1])
-    axes[1].set_title("Internal Core N2O Sources", fontweight='bold')
+    axes[1].set_title("Inside Particle Only (Core N2O Sources)", fontweight='bold')
     axes[1].set_xlabel("Particle Radius (mm)")
     axes[1].grid(True, linestyle='--', alpha=0.7)
 
-    plt.suptitle("N2O Source Apportionment vs. Particle Size (O2=6.0, NO3=10.0)", fontsize=16, fontweight='bold', y=1.02)
+    # Dynamic Title
+    plt.suptitle(f"N2O Source Apportionment vs. Particle Size (O2={base_o2}, NO3={base_no3})", fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig("outputs/Plot5_N2O_Sources_Dual.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 6: Boundary Layer Exchange Fluxes & Plume Leakage ──
+    # ── PLOT 6: Boundary Layer Exchange Fluxes ──
     fig, axes = plt.subplots(1, 4, figsize=(24, 5))
     
     sns.lineplot(data=df, x='Ext_O2', y='O2_Flux_In_mmol_s', hue='Radius_mm', 
                  palette='viridis', marker='o', linewidth=2.5, ax=axes[0])
-    axes[0].set_title('O2 Inward Flux vs Ambient O2', fontweight='bold')
+    axes[0].set_title('O2 Flux Across Boundary (Into Particle)', fontweight='bold')
     axes[0].set_xlabel('Ambient O2 (mmol/m3)')
-    axes[0].set_ylabel('O2 Flux Into Particle (mmol/s)')
+    axes[0].set_ylabel('O2 Flux (mmol/s)')
     axes[0].grid(True, linestyle='--', alpha=0.7)
 
     sns.lineplot(data=df, x='Ext_NO3', y='NO3_Flux_In_mmol_s', hue='Radius_mm', 
                  palette='flare', marker='s', linewidth=2.5, ax=axes[1])
-    axes[1].set_title('NO3 Inward Flux vs Ambient NO3', fontweight='bold')
+    axes[1].set_title('NO3 Flux Across Boundary (Into Particle)', fontweight='bold')
     axes[1].set_xlabel('Ambient NO3 (mmol/m3)')
-    axes[1].set_ylabel('NO3 Flux Into Particle (mmol/s)')
+    axes[1].set_ylabel('NO3 Flux (mmol/s)')
     axes[1].grid(True, linestyle='--', alpha=0.7)
 
     sns.lineplot(data=df, x='Ext_O2', y='DOC_Flux_Out_mmol_s', hue='Radius_mm', 
                  palette='copper', marker='^', linewidth=2.5, ax=axes[2])
-    axes[2].set_title('DOC Leakage (Plume Fuel) vs Ambient O2', fontweight='bold')
+    axes[2].set_title('DOC Flux Across Boundary (Out of Particle)', fontweight='bold')
     axes[2].set_xlabel('Ambient O2 (mmol/m3)')
-    axes[2].set_ylabel('DOC Flux Out of Particle (mmol/s)')
+    axes[2].set_ylabel('DOC Leakage (mmol/s)')
     axes[2].grid(True, linestyle='--', alpha=0.7)
 
-    # Updated to use the physically correct Gauss Theorem variable
     sns.lineplot(data=df, x='Ext_O2', y='N2O_Leakage_Out_mmol_s', hue='Radius_mm', 
                  palette='magma', marker='X', linewidth=2.5, ax=axes[3])
-    axes[3].set_title('True N2O Leakage into Plume', fontweight='bold')
+    axes[3].set_title('N2O Flux Across Boundary (Out of Particle)', fontweight='bold')
     axes[3].set_xlabel('Ambient O2 (mmol/m3)')
-    axes[3].set_ylabel('Physical N2O Leakage (mmol/s)')
+    axes[3].set_ylabel('N2O Leakage (mmol/s)')
     axes[3].grid(True, linestyle='--', alpha=0.7)
 
     plt.tight_layout()
     plt.savefig("outputs/Plot6_Boundary_Fluxes.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 7: Absolute N2O Flux (Restricted to Particle Core) ──
+    # ── PLOT 7: Absolute N2O Flux (Inside Core Only) ──
     radii = sorted(df['Radius_mm'].unique())
     fig, axes = plt.subplots(1, len(radii), figsize=(5 * len(radii), 5), sharey=True)
 
     for i, r in enumerate(radii):
         ax = axes[i]
-        subset = df[df['Radius_mm'] == r] # Fixed the crash bug!
+        subset = df[df['Radius_mm'] == r]
 
         sns.lineplot(data=subset, x='Ext_O2', y='N2O_Flux_Internal', hue='Ext_NO3', 
                      palette=['#5DADE2', '#2874A6', '#154360'], 
@@ -356,7 +368,7 @@ def generate_all_plots(csv_filename):
         ax.set_xlabel('Ambient O2 (mmol/m3)')
         
         if i == 0:
-            ax.set_ylabel('Internal N2O Net Rate (mmol/s)\n<-- Net consumption   |   Net production -->')
+            ax.set_ylabel('Internal Core N2O Net Rate (mmol/s)\n<-- Net consumption inside   |   Net production inside -->')
         else:
             ax.set_ylabel('')
             
@@ -367,26 +379,27 @@ def generate_all_plots(csv_filename):
     fig.legend(handles, labels, title='Ambient NO3 (mmol/m3)', loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=3, frameon=True)
 
     plt.subplots_adjust(top=0.85, bottom=0.25)
-    fig.suptitle("Absolute N2O Flux Inside Particle Core", fontsize=16, fontweight='bold', y=0.98)
+    fig.suptitle("Absolute N2O Net Flux (Inside Particle Core Only)", fontsize=16, fontweight='bold', y=0.98)
     plt.savefig("outputs/Plot7_Internal_Flux_Only.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 8: Anoxic "Dead Core" Fraction vs. Radius ──
+    # ── PLOT 8: Anoxic "Dead Core" Fraction (Inside Core Only) ──
     plt.figure(figsize=(8, 6))
     sns.lineplot(data=df, x='Radius_mm', y='Frac_Anoxic_Core', hue='Ext_O2', 
                  marker="s", linewidth=2.5, palette="crest")
     
-    plt.title("Anoxic Core Volume Fraction vs. Particle Size", fontweight='bold')
+    plt.title("Anoxic Core Fraction (Inside Particle Only)", fontweight='bold')
     plt.xlabel("Particle Radius (mm)")
     plt.ylabel("Fraction of Core Volume (< 1.0 mmol/m3 O2)")
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(title="Ambient O2 (mmol/m3)")
     plt.savefig("outputs/Plot8_Anoxic_Core.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 9: Terminal Ratio (N2 Sink vs N2O Source) ──
+    # ── PLOT 9: Terminal Ratio (Whole Domain) ──
     df['Terminal_Ratio'] = df['N2_Flux_Total_mmol_s'] / (df['N2O_Flux_Total_mmol_s'] + 1e-12)
 
     plt.figure(figsize=(8, 6))
-    df_ratio = df[df['Ext_NO3'] == 10.0]
+    # Filtering dynamically based on available NO3
+    df_ratio = df[df['Ext_NO3'] == base_no3]
 
     sns.lineplot(data=df_ratio, x='Radius_mm', y='Terminal_Ratio', hue='Ext_O2', 
                  marker="D", linewidth=2.5, palette="rocket")
@@ -394,9 +407,10 @@ def generate_all_plots(csv_filename):
     plt.axhline(1.0, color='black', linestyle='--', linewidth=1.5, zorder=0) 
     plt.yscale('log') 
     
-    plt.title("Terminal N2/N2O Ratio vs. Particle Size (NO3=10.0)", fontweight='bold')
+    # Dynamic Title
+    plt.title(f"Total Domain Terminal N2/N2O Ratio (Core + Plume, NO3={base_no3})", fontweight='bold')
     plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("N2 / N2O Ratio (Log Scale)\n<-- More N2O  |  More N2 -->")
+    plt.ylabel("Total System N2 / N2O Ratio (Log Scale)\n<-- System is N2O Source  |  System is N2 Sink -->")
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(title="Ambient O2 (mmol/m3)")
     plt.savefig("outputs/Plot9_Terminal_Ratio.png", dpi=300, bbox_inches='tight')
@@ -408,17 +422,18 @@ def main():
     print("🌊 Starting NitrOMZ Parameter Suite...\n")
     cfg.is_suite = True 
 
-    radii = [0.5, 1.0, 1.5, 2.0, 3.0]
+    radii = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
     o2_levels = [2.0, 6.0, 10.0]
-    no3_levels = [5.0, 10.0, 15.0]
+    no3_levels = [10.0]
     
     # ── 1. Create a clean outputs directory ──
     out_dir = "outputs"
     os.makedirs(out_dir, exist_ok=True)
 
     # ── 2. Auto-generate a unique timestamped filename ──
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
-    csv_filename = os.path.join(out_dir, f"NitrOMZ_Suite_{timestamp}.csv")
+    # timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+    # csv_filename = os.path.join(out_dir, f"NitrOMZ_Suite_{timestamp}.csv")
+    csv_filename = "outputs/NitrOMZ_Suite_2026-05-04_1518.csv"
 
     if os.path.exists(csv_filename):
         results_df = pd.read_csv(csv_filename)
@@ -427,9 +442,17 @@ def main():
         results_df.to_csv(csv_filename, index=False)
         completed_runs = set(zip(results_df['Radius_mm'], results_df['Ext_O2'], results_df['Ext_NO3']))
         results_data = results_df.to_dict('records')
+        
+        # ── NEW: Resume Confirmation Print ──
+        print(f"🔄 RESUMING RUN: Found existing data in '{csv_filename}'.")
+        print(f"⏭️ Skipping {len(completed_runs)} previously completed runs.\n")
+
     else:
         completed_runs = set()
         results_data = []
+        
+        # ── NEW: Fresh Run Confirmation Print ──
+        print(f"🆕 Starting a completely fresh suite. Saving to '{csv_filename}'...\n")
 
     total_runs = len(radii) * len(o2_levels) * len(no3_levels)
     

@@ -1,6 +1,6 @@
 # config.py
 # ── Particle Parameters ───────────────────────────────────────────────────────
-radius = 3
+radius = 1
 
 # ── Domain (Scaled by radius) ─────────────────────────────────────────────────
 Lx = 20.0 * radius  
@@ -22,13 +22,13 @@ Sc_target = 660
 nu = 1.04  # Physically realistic kinematic viscosity for seawater (mm^2/s)
 
 # Calculate required background velocity
-U_bg = 2.2 * (radius / 1.0)**0#.56
+U_bg = 2.2 * (radius / 1.0)**0.56
 
 Re_actual = (U_bg * (2.0 * radius)) / nu
 Pe_calc = Re_actual * Sc_target  
 
 # Calculate total time based on 5x the domain length
-Total_Time = 5 * Lx / U_bg
+Total_Time = 15#5 * Lx / U_bg
 
 # 1. Calculate the true physical diffusivity
 K = nu / Sc_target
@@ -43,6 +43,7 @@ K = nu / Sc_target
 Sh = 1 + 0.619 * Re_actual ** 0.412 * Sc_target**(1/3)
 
 print(f"\n── Simulation Physics ──")
+print(f"Radius   | R: {radius}")
 print(f"Targets  | Re: {Re_actual:.2f}  |  Sc: {Sc_target}  |  Pe: {Pe_calc:.2f}")
 print(f"Derived  | U_bg: {U_bg:.3f} mm/s | nu: {nu:.2f} |  K:  {K:.4f}")
 print(f"Time     | Total_Time: {Total_Time:.2f} s")

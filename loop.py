@@ -5,7 +5,7 @@ import time as _time
 from tqdm import tqdm
 from alive_progress import alive_bar
 
-from bcs import apply_bcs
+from bcs import apply_bcs, enforce_symmetry
 from physics import get_psi_pert, get_rhs_batched
 
 def run_simulation(state, cfg, device):
@@ -73,6 +73,8 @@ def run_simulation(state, cfg, device):
         t_temp = {name: (1/3) * tracers[name] + (2/3) * (t2[name] + dt * rhs_tracers[name]) for name in tracer_names}
         w, tracers = apply_bcs(w_temp, t_temp)
 
+        w, tracers = enforce_symmetry(w, tracers, tracer_names)
+
         u_full.zero_()
         v_full.zero_()
         u_full[:, 1:-1] = (psi_tot[:, 2:] - psi_tot[:, :-2]) * state['inv_2dy']
@@ -111,7 +113,7 @@ def run_simulation(state, cfg, device):
 
         # ── 3. SAFETY KILL SWITCH ──
         # Check for NaNs/Infs every 100 steps (prevents GPU sync bottleneck)
-        if n % 100 == 0:
+        if n % 1000 == 0:
             # 1. Check fluid momentum
             if not torch.isfinite(w).all().item():
                 print(f"\n🚨 FATAL ERROR: NaN or Inf detected in fluid vorticity (w) at step {n} (time = {current_time:.3f}s)!")
@@ -131,5 +133,4 @@ def run_simulation(state, cfg, device):
     total_elapsed = _time.perf_counter() - _loop_start
     print(f"\nSimulation complete in {total_elapsed:.1f}s. Generating animations...")
 
-    # ADDED: Tacked the two new tracers onto the VERY END so it doesn't break index 0-10!
     return c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, doc_snapshots, nh4_snapshots, w_snapshots, u_snapshots, v_snapshots, snapshot_times, n2o_ammox_snapshots, n2o_denit_snapshots

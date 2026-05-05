@@ -58,14 +58,25 @@ def setup_physics(cfg):
     # store so it can be put onto the plot
     cfg.dt = dt
 
-    
+    # Mirror the raw drag mask about y = Ny//2 before smoothing
+    mid_y = cfg.Ny // 2
+    drag_mask_np[:, :mid_y] = drag_mask_np[:, cfg.Ny - 1 - np.arange(mid_y)]  # force symmetry
+    drag_mask_np = gaussian_filter(drag_mask_np, sigma=1.0)
+    # Mirror again after smoothing to kill any Gaussian discretization asymmetry
+    drag_mask_np[:, :mid_y] = drag_mask_np[:, -1:-mid_y-1:-1]
 
-    drag_mask_np = gaussian_filter(drag_mask_np, sigma=1.5)
+
+    # drag_mask_np = gaussian_filter(drag_mask_np, sigma=1.5)
     da_dx_np, da_dy_np = np.gradient(drag_mask_np, cfg.dx, cfg.dy)
 
     # Dictionary to hold all dynamic tensor states
     state = {}
     state['dt'] = dt
+    state['nu'] = torch.tensor(cfg.nu, dtype=torch.float32, device=device)
+    state['K']  = torch.tensor(cfg.K, dtype=torch.float32, device=device)
+    state['inv_dx'] = torch.tensor(1.0 / cfg.dx, dtype=torch.float32, device=device)
+    state['inv_dy'] = torch.tensor(1.0 / cfg.dy, dtype=torch.float32, device=device)
+    state['doc_flux'] = torch.tensor(getattr(cfg, 'doc_flux_rate', 0.0), dtype=torch.float32, device=device)
     
     # Instantiate Biological Parameters
     state['bgc'] = BioPar()
@@ -112,11 +123,11 @@ def setup_physics(cfg):
     state['v_full'] = torch.zeros((cfg.Nx, cfg.Ny), dtype=torch.float32, device=device)
 
     # Precompute reciprocal constants
-    state['inv_4dxdy'] = 1.0 / (4.0 * cfg.dx * cfg.dy)
-    state['inv_dx2']   = 1.0 / cfg.dx**2
-    state['inv_dy2']   = 1.0 / cfg.dy**2
-    state['inv_2dy']   = 1.0 / (2.0 * cfg.dy)
-    state['inv_2dx']   = 1.0 / (2.0 * cfg.dx)
+    state['inv_4dxdy'] = torch.tensor(1.0 / (4.0 * cfg.dx * cfg.dy), dtype=torch.float32, device=device)
+    state['inv_dx2']   = torch.tensor(1.0 / cfg.dx**2,                dtype=torch.float32, device=device)
+    state['inv_dy2']   = torch.tensor(1.0 / cfg.dy**2,                dtype=torch.float32, device=device)
+    state['inv_2dy']   = torch.tensor(1.0 / (2.0 * cfg.dy),           dtype=torch.float32, device=device)
+    state['inv_2dx']   = torch.tensor(1.0 / (2.0 * cfg.dx),           dtype=torch.float32, device=device)
 
     # Precompute Poisson eigenvalues
     Ni, Nj = cfg.Nx - 2, cfg.Ny - 2
@@ -228,7 +239,7 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
     day = state['da_dy'][1:-1, 1:-1]
     
     drag  = dm * w_c - (day * u_c - dax * v_c)
-    rhs_w = J_avg + cfg.nu * lap[0] - drag
+    rhs_w = J_avg + state['nu'] * lap[0] - drag
     state['_rhs_buf_w'][1:-1, 1:-1] = rhs_w
 
     # ── 3. Tracer Advection: 1st-Order Upwind Scheme ──
@@ -239,9 +250,13 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
     u_vel = u_c.unsqueeze(0)
     v_vel = v_c.unsqueeze(0)
     
-    # Upwind Logic: Look left if moving right, look right if moving left
-    adv_x = torch.where(u_vel > 0, u_vel * (t_c - t_w) / cfg.dx, u_vel * (t_e - t_c) / cfg.dx)
-    adv_y = torch.where(v_vel > 0, v_vel * (t_c - t_s) / cfg.dy, v_vel * (t_n - t_c) / cfg.dy)
+    # # Pre-cast the floats to 32-bit so the compiler doesn't panic
+    # inv_dx = float(1.0 / cfg.dx)
+    # inv_dy = float(1.0 / cfg.dy)
+    
+    # Use > 0.0 instead of > 0 to prevent integer-to-float64 promotion
+    adv_x = torch.where(u_vel > 0, u_vel * (t_c - t_w) * state['inv_dx'], u_vel * (t_e - t_c) * state['inv_dx'])
+    adv_y = torch.where(v_vel > 0, v_vel * (t_c - t_s) * state['inv_dy'], v_vel * (t_n - t_c) * state['inv_dy'])
     
     # The advective flux leaving the cell
     tracer_advection = -(adv_x + adv_y)
@@ -254,12 +269,10 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
     for i, name in enumerate(tracer_names):
         
         # Upwind Advection + Central Diffusion + Microbial Consumption
-        rhs_t = tracer_advection[i] + cfg.K * lap[i+1] + ddt[name]
+        rhs_t = tracer_advection[i] + state['K'] * lap[i+1] + ddt[name]
         
-        # Add the POC-to-DOC flux
         if name == 'doc':
-            flux_rate = getattr(cfg, 'doc_flux_rate', 0.0) 
-            rhs_t += flux_rate * state['particle_mask'][1:-1, 1:-1]
+            rhs_t += state['doc_flux'] * state['particle_mask'][1:-1, 1:-1]
             
         state['_rhs_tracers'][name][1:-1, 1:-1] = rhs_t
 
@@ -276,11 +289,22 @@ def bilinear_interp_gpu(field, px_t, py_t, cfg):
           + field[ix,     iy + 1] * (1 - fx)  * fy
           + field[ix + 1, iy + 1] * fx         * fy)
 
-# Apply Torch compile if available
+# # Apply Torch compile if available
+# if hasattr(torch, 'compile'):
+#     try:
+#         get_rhs_batched = torch.compile(get_rhs_batched) 
+#         print("✅ torch.compile enabled for RHS physics (inductor backend)")
+#     except Exception as e:
+#         print(f"⚠️  torch.compile skipped: {e}")
+
 if hasattr(torch, 'compile'):
     try:
-        get_rhs_batched = torch.compile(get_rhs_batched) 
-        print("✅ torch.compile enabled for RHS physics (inductor backend)")
+        get_rhs_batched = torch.compile(
+            get_rhs_batched,
+            fullgraph=True,       # Fails loudly if there are graph breaks (better than silent slowdowns)
+            mode="reduce-overhead" # Reduces Python dispatch overhead per call — ideal for a loop
+        )
+        print("✅ torch.compile enabled for RHS physics")
     except Exception as e:
         print(f"⚠️  torch.compile skipped: {e}")
 

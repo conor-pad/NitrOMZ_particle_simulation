@@ -5,6 +5,7 @@ import logging
 
 # Essential environment variables for M2 Mac
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["TORCH_LOGS"] = "recompiles"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 warnings.filterwarnings("ignore", message=".*resized since it had shape.*")
 warnings.filterwarnings("ignore", category=UserWarning)
