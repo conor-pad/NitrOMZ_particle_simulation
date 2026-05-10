@@ -1,4 +1,5 @@
 # config.py
+use_symmetry = True # artifical enforced symmetry to stop the model from exploding.
 # ── Particle Parameters ───────────────────────────────────────────────────────
 radius = 1
 

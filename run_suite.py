@@ -190,7 +190,7 @@ def run_experiment(radius, ext_o2, ext_no3):
     }
     
     metrics.update(residence_times)
-    torch.save(final_tensors, f"outputs/Tensors_R{radius}_O2{ext_o2}_NO3{ext_no3}.pt")
+    # torch.save(final_tensors, f"outputs/Tensors_R{radius}_O2{ext_o2}_NO3{ext_no3}.pt")
     return metrics
 
 def generate_all_plots(csv_filename):
@@ -208,15 +208,29 @@ def generate_all_plots(csv_filename):
     
     print(f"\n📊 Plotting Baselines Auto-Selected -> O2: {base_o2}, NO3: {base_no3}")
 
-    # ── PLOT 1: Normalized N2O Yield (Whole Domain) ──
-    g1 = sns.FacetGrid(df, col="Radius_mm", hue="Ext_NO3", palette="magma", height=4.5, aspect=1.2, sharey=False)
-    g1.map(sns.lineplot, "Ext_O2", "N2O_Yield_per_C", marker="o", linewidth=2.5, markersize=8)
-    g1.set_axis_labels("Ambient O2 (mmol/m3)", "Total Domain N2O Yield\n(mmol N2O / mmol Total C metabolized)")
-    g1.set_titles(col_template="Particle Radius: {col_name} mm")
-    g1.add_legend(title="Ambient NO3 (mmol/m3)", loc='upper center', bbox_to_anchor=(0.45, -0.15), ncol=3, frameon=True)
-    plt.subplots_adjust(top=0.85, bottom=0.25)
-    g1.fig.suptitle("N2O Production Efficiency vs. Ambient O2 & NO3 (Core + Plume)", fontsize=16, fontweight='bold', y=0.98)
-    plt.savefig(f"outputs/Plot1_N2O_Yield.png", dpi=300, bbox_inches='tight')
+   # ── PLOT 1: Normalized N2O Yield Contour (Whole Domain) ──
+    plt.figure(figsize=(9, 6))
+    
+    # Filter for the locked NO3 and pivot data into a 2D grid
+    df_p1 = df[df['Ext_NO3'] == base_no3]
+    pivot1 = df_p1.pivot(index='Ext_O2', columns='Radius_mm', values='N2O_Yield_per_C')
+    X1, Y1 = np.meshgrid(pivot1.columns, pivot1.index)
+    Z1 = pivot1.values
+
+    # Draw the filled contours
+    cf1 = plt.contourf(X1, Y1, Z1, levels=20, cmap='viridis')
+    cbar1 = plt.colorbar(cf1)
+    cbar1.set_label('Total Domain N2O Yield\n(mmol N2O / mmol Total C metabolized)')
+
+    # Overlay the actual simulated data points
+    plt.scatter(X1, Y1, color='black', s=15, alpha=0.5, zorder=5)
+
+    plt.xlabel("Particle Radius (mm)")
+    plt.ylabel("Ambient O2 (mmol/m3)")
+    plt.title(f"N2O Production Efficiency (Core + Plume) | NO3 = {base_no3}", fontsize=14, fontweight='bold', pad=15)
+    
+    plt.tight_layout()
+    plt.savefig("outputs/Plot1_N2O_Yield.png", dpi=300, bbox_inches='tight')
 
     # ── PLOTS 2 & 3: Metabolic Architecture (Core vs Plume) ──
     # Filtering dynamically based on the available data!
@@ -351,35 +365,36 @@ def generate_all_plots(csv_filename):
     plt.tight_layout()
     plt.savefig("outputs/Plot6_Boundary_Fluxes.png", dpi=300, bbox_inches='tight')
 
-    # ── PLOT 7: Absolute N2O Flux (Inside Core Only) ──
-    radii = sorted(df['Radius_mm'].unique())
-    fig, axes = plt.subplots(1, len(radii), figsize=(5 * len(radii), 5), sharey=True)
-
-    for i, r in enumerate(radii):
-        ax = axes[i]
-        subset = df[df['Radius_mm'] == r]
-
-        sns.lineplot(data=subset, x='Ext_O2', y='N2O_Flux_Internal', hue='Ext_NO3', 
-                     palette=['#5DADE2', '#2874A6', '#154360'], 
-                     ax=ax, linewidth=3, marker='X', linestyle='--', errorbar=None)
-        
-        ax.axhline(0, color='black', linewidth=1.5, zorder=0)
-        ax.set_title(f"Particle Radius: {r} mm", fontweight='bold')
-        ax.set_xlabel('Ambient O2 (mmol/m3)')
-        
-        if i == 0:
-            ax.set_ylabel('Internal Core N2O Net Rate (mmol/s)\n<-- Net consumption inside   |   Net production inside -->')
-        else:
-            ax.set_ylabel('')
-            
-        if ax.get_legend() is not None:
-            ax.get_legend().remove()
+   # ── PLOT 7: Absolute N2O Flux Contour (Inside Core Only) ──
+    plt.figure(figsize=(9, 6))
     
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, title='Ambient NO3 (mmol/m3)', loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=3, frameon=True)
+    # Filter for the locked NO3 and pivot data into a 2D grid
+    df_p7 = df[df['Ext_NO3'] == base_no3]
+    pivot7 = df_p7.pivot(index='Ext_O2', columns='Radius_mm', values='N2O_Flux_Internal')
+    X7, Y7 = np.meshgrid(pivot7.columns, pivot7.index)
+    Z7 = pivot7.values
 
-    plt.subplots_adjust(top=0.85, bottom=0.25)
-    fig.suptitle("Absolute N2O Net Flux (Inside Particle Core Only)", fontsize=16, fontweight='bold', y=0.98)
+    # Find the maximum absolute value to perfectly center 0 on white
+    max_abs = max(abs(np.nanmax(Z7)), abs(np.nanmin(Z7)))
+    if max_abs == 0: max_abs = 1e-10  # Prevent divide-by-zero if completely flat
+    
+    # Draw the filled contours using a diverging Red/Blue colormap
+    cf7 = plt.contourf(X7, Y7, Z7, levels=30, cmap='RdBu_r', vmin=-max_abs, vmax=max_abs)
+    
+    cbar7 = plt.colorbar(cf7)
+    cbar7.set_label('Internal Core N2O Net Rate (mmol/s)\n<-- Net Consumption (Blue)   |   Net Production (Red) -->')
+
+    # Draw the zero-flux contour line explicitly as a solid black line
+    plt.contour(X7, Y7, Z7, levels=[0], colors='black', linewidths=2)
+
+    # Overlay the actual simulated data points
+    plt.scatter(X7, Y7, color='black', s=15, alpha=0.5, zorder=5)
+
+    plt.xlabel("Particle Radius (mm)")
+    plt.ylabel("Ambient O2 (mmol/m3)")
+    plt.title(f"Absolute N2O Net Flux (Inside Particle Core Only) | NO3 = {base_no3}", fontsize=14, fontweight='bold', pad=15)
+    
+    plt.tight_layout()
     plt.savefig("outputs/Plot7_Internal_Flux_Only.png", dpi=300, bbox_inches='tight')
 
     # ── PLOT 8: Anoxic "Dead Core" Fraction (Inside Core Only) ──
@@ -410,10 +425,44 @@ def generate_all_plots(csv_filename):
     # Dynamic Title
     plt.title(f"Total Domain Terminal N2/N2O Ratio (Core + Plume, NO3={base_no3})", fontweight='bold')
     plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Total System N2 / N2O Ratio (Log Scale)\n<-- System is N2O Source  |  System is N2 Sink -->")
+    plt.ylabel("Total System N2 / N2O Ratio (Log Scale)\n<-- System is N2O Source  |  System is N2 Source -->")
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.legend(title="Ambient O2 (mmol/m3)")
     plt.savefig("outputs/Plot9_Terminal_Ratio.png", dpi=300, bbox_inches='tight')
+
+    # ── PLOT 10: Metabolic pathway vs Ambient O2 ──
+      # Get available NO3 and a specific Radius to look at (e.g., 1.0mm or the first available)
+    available_no3 = df['Ext_NO3'].unique()
+    base_no3 = 10.0 if 10.0 in available_no3 else available_no3[0]
+    available_radii = df['Radius_mm'].unique()
+    base_radius = 1.0 if 1.0 in available_radii else available_radii[0]
+
+    df_base = df[(df['Radius_mm'] == base_radius) & (df['Ext_NO3'] == base_no3)].copy()
+
+    def get_melted_fractions(df_in, zone_suffix, x_var):
+        cols = [f'Frac_Oxic_{zone_suffix}', f'Frac_Den1_{zone_suffix}', f'Frac_Den2_{zone_suffix}', f'Frac_Den3_{zone_suffix}']
+        melted = df_in.melt(id_vars=[x_var], value_vars=cols, var_name='Pathway', value_name='Fraction')
+        melted['Pathway'] = melted['Pathway'].str.replace('Frac_', '').str.replace(f'_{zone_suffix}', '')
+        return melted
+
+    df_core_o2 = get_melted_fractions(df_base, 'Core', 'Ext_O2')
+    df_plume_o2 = get_melted_fractions(df_base, 'Plume', 'Ext_O2')
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+    sns.lineplot(data=df_core_o2, x='Ext_O2', y='Fraction', hue='Pathway', marker="o", linewidth=2.5, ax=axes[0])
+    axes[0].set_title("Inside Particle Only (Core Metabolism)", fontweight='bold')
+    axes[0].set_xlabel("Ambient O2 (mmol/m3)")
+    axes[0].set_ylabel("Fraction of DOC Consumed")
+
+    sns.lineplot(data=df_plume_o2, x='Ext_O2', y='Fraction', hue='Pathway', marker="o", linewidth=2.5, ax=axes[1])
+    axes[1].set_title("Outside Particle Only (Plume/Wake Metabolism)", fontweight='bold')
+    axes[1].set_xlabel("Ambient O2 (mmol/m3)")
+
+    plt.suptitle(f"Metabolic Partitioning vs. Oxygen Levels (Radius={base_radius}mm, NO3={base_no3})", 
+                 fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    plt.savefig("outputs/Plot10_Metabolism_vs_O2.png", dpi=300, bbox_inches='tight')
+    print("✅ Plot 10 saved: outputs/Plot10_Metabolism_vs_O2.png")
 
     plt.show()
 
@@ -422,7 +471,7 @@ def main():
     print("🌊 Starting NitrOMZ Parameter Suite...\n")
     cfg.is_suite = True 
 
-    radii = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
+    radii = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 0.25, 1.25, 2.5, 2.75, 3.25, 2.25, 1.75, 2.625, 2.375]
     o2_levels = [2.0, 6.0, 10.0]
     no3_levels = [10.0]
     
@@ -482,5 +531,9 @@ def main():
 
     generate_all_plots(csv_filename)
 
+
+
+
+
 if __name__ == "__main__":
-    main()
+    main() 

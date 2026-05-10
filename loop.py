@@ -69,11 +69,13 @@ def run_simulation(state, cfg, device):
         psi_tot  = psi_pert + psi_bg
         rhs_w, rhs_tracers = get_rhs_batched(w2, t2, psi_tot, state, cfg)
         
-        w_temp = (1/3) * w + (2/3) * (w2 + dt * rhs_w)
-        t_temp = {name: (1/3) * tracers[name] + (2/3) * (t2[name] + dt * rhs_tracers[name]) for name in tracer_names}
+        w_temp = (1.0/3.0) * w + (2.0/3.0) * (w2 + dt * rhs_w)
+        t_temp = {name: (1.0/3.0) * tracers[name] + (2.0/3.0) * (t2[name] + dt * rhs_tracers[name]) for name in tracer_names}
         w, tracers = apply_bcs(w_temp, t_temp)
-
-        w, tracers = enforce_symmetry(w, tracers, tracer_names)
+        
+        
+        if getattr(cfg, 'use_symmetry', True):
+            w, tracers = enforce_symmetry(w, tracers, tracer_names)
 
         u_full.zero_()
         v_full.zero_()
