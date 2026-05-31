@@ -29,7 +29,7 @@ Re_actual = (U_bg * (2.0 * radius)) / nu
 Pe_calc = Re_actual * Sc_target  
 
 # Calculate total time based on 5x the domain length
-Total_Time = 15#5 * Lx / U_bg
+Total_Time = 35#5 * Lx / U_bg
 
 # 1. Calculate the true physical diffusivity
 K = nu / Sc_target
