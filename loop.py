@@ -79,8 +79,8 @@ def run_simulation(state, cfg, device):
 
         u_full.zero_()
         v_full.zero_()
-        u_full[:, 1:-1] = (psi_tot[:, 2:] - psi_tot[:, :-2]) * state['inv_2dy']
-        v_full[1:-1, :] = -(psi_tot[2:, :] - psi_tot[:-2, :]) * state['inv_2dx']
+        u_full[..., 1:-1] = (psi_tot[..., 2:] - psi_tot[..., :-2]) * state['inv_2dy']
+        v_full[..., 1:-1, :] = -(psi_tot[..., 2:, :] - psi_tot[..., :-2, :]) * state['inv_2dx']
 
         # ── Snapshots ────────────────────────────────────────────────────────
         # 1. RAM Fix: Only save the very last frame if running the suite
