@@ -17,7 +17,6 @@ def run_simulation(state, cfg, device):
     v_full = state['v_full']
     tracer_names = state['tracer_names']
 
-    # We only save O2 and N2O to keep memory usage low and because plotting.py expects them
     w_snapshots, c_snapshots, n2o_snapshots, no3_snapshots, no2_snapshots, n2_snapshots, nh4_snapshots, doc_snapshots = [], [], [], [], [], [], [], []
     u_snapshots, v_snapshots = [], []
     snapshot_times = []
@@ -39,16 +38,18 @@ def run_simulation(state, cfg, device):
                   unit="steps",
                   bar_format='{desc}: {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'):
 
-        # with alive_bar(n_steps, title="Simulating..", bar="smooth", spinner="waves", length=40) as bar:
-    
-        # for n in range(n_steps): # remove if using tqdm, indent everything back 1.
-
         current_time = n * dt
+
+        # ── 1. Calculate Transient DOC Flux from POC Decay ──
+        # POC(t) = POC_0 * exp(-k * t)
+        # Flux (dC/dt) = k * POC(t)
+        current_poc = state['poc_initial'] * torch.exp(-state['k_hyd'] * current_time)
+        doc_flux_t = state['k_hyd'] * current_poc
 
         # ── STAGE 1 ──────────────────────────────────────────────────────────
         psi_pert = get_psi_pert(w, state)
         psi_tot  = psi_pert + psi_bg
-        rhs_w, rhs_tracers = get_rhs_batched(w, tracers, psi_tot, state, cfg)
+        rhs_w, rhs_tracers = get_rhs_batched(w, tracers, psi_tot, state, cfg, doc_flux_t)
         
         # Dictionary comprehension to apply Euler step to all 8 tracers instantly
         w1_temp = w + dt * rhs_w
@@ -58,7 +59,7 @@ def run_simulation(state, cfg, device):
         # ── STAGE 2 ──────────────────────────────────────────────────────────
         psi_pert = get_psi_pert(w1, state)
         psi_tot  = psi_pert + psi_bg
-        rhs_w, rhs_tracers = get_rhs_batched(w1, t1, psi_tot, state, cfg)
+        rhs_w, rhs_tracers = get_rhs_batched(w1, t1, psi_tot, state, cfg, doc_flux_t)
         
         w2_temp = 0.75 * w + 0.25 * (w1 + dt * rhs_w)
         t2_temp = {name: 0.75 * tracers[name] + 0.25 * (t1[name] + dt * rhs_tracers[name]) for name in tracer_names}
@@ -67,7 +68,7 @@ def run_simulation(state, cfg, device):
         # ── STAGE 3 ──────────────────────────────────────────────────────────
         psi_pert = get_psi_pert(w2, state)
         psi_tot  = psi_pert + psi_bg
-        rhs_w, rhs_tracers = get_rhs_batched(w2, t2, psi_tot, state, cfg)
+        rhs_w, rhs_tracers = get_rhs_batched(w2, t2, psi_tot, state, cfg, doc_flux_t)
         
         w_temp = (1.0/3.0) * w + (2.0/3.0) * (w2 + dt * rhs_w)
         t_temp = {name: (1.0/3.0) * tracers[name] + (2.0/3.0) * (t2[name] + dt * rhs_tracers[name]) for name in tracer_names}
@@ -111,8 +112,6 @@ def run_simulation(state, cfg, device):
         if n % 1000 == 0:
             torch.mps.empty_cache()
 
-            # bar()
-
         # ── 3. SAFETY KILL SWITCH ──
         # Check for NaNs/Infs every 100 steps (prevents GPU sync bottleneck)
         if n % 1000 == 0:
@@ -131,6 +130,16 @@ def run_simulation(state, cfg, device):
             
             if tracer_crashed:
                 break # Kills the outer loop
+
+            # ── Terminate on POC + DOC Exhaustion ──
+            dV_m3 = (cfg.dx[0] * cfg.dy[0] * 1.0) * 1e-9
+            
+            initial_poc_mass = torch.sum(state['poc_initial']).item() * dV_m3
+            current_poc_mass = torch.sum(state['poc_initial'] * torch.exp(-state['k_hyd'] * current_time)).item() * dV_m3
+            current_doc_mass = torch.sum(tracers['doc']).item() * dV_m3
+            
+            if (current_poc_mass + current_doc_mass) < (0.01 * initial_poc_mass):
+                break
 
     total_elapsed = _time.perf_counter() - _loop_start
     print(f"\nSimulation complete in {total_elapsed:.1f}s. Generating animations...")

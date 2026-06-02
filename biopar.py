@@ -10,6 +10,7 @@ class BioPar:
     """
     
     # ── Organic Matter Composition (Anderson & Sarmiento 1994) ──
+    k_hyd: float = 0.1      # POC hydrolysis rate (1/d) -> Approx 10-day half-life for solid carbon
     stoch_a: float = 106.0  # C
     stoch_b: float = 175.0  # H
     stoch_c: float = 42.0   # O

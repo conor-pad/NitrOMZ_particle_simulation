@@ -88,10 +88,25 @@ def setup_physics(cfg):
     state['K']  = torch.tensor(cfg.K, dtype=torch.float32, device=device)
     state['inv_dx'] = torch.tensor(1.0 / dx_b, dtype=torch.float32, device=device)
     state['inv_dy'] = torch.tensor(1.0 / dy_b, dtype=torch.float32, device=device)
-    state['doc_flux'] = torch.tensor(getattr(cfg, 'doc_flux_rate', 0.0), dtype=torch.float32, device=device)
     
     # Instantiate Biological Parameters
     state['bgc'] = BioPar()
+    
+    # ── NEW: Dynamic POC Initialization (Alldredge 1998) ──
+    radius_arr = b_arr(cfg.radius)
+    V_mm3 = np.pi * (radius_arr ** 2) * 1.0               # Assume 1mm cylinder height
+    poc_ug = 0.99 * (V_mm3 ** 0.52)                       # Fractal scaling
+    poc_mmol = poc_ug / 12010                             # Convert to mmol C
+    poc_initial_density = poc_mmol / (V_mm3 * 1e-9)       # Convert to mmol/m^3
+    
+    # Cache constants for the physics loop
+    state['k_hyd'] = torch.tensor(state['bgc'].k_hyd, dtype=torch.float32, device=device)
+    state['poc_initial'] = torch.tensor(poc_initial_density, dtype=torch.float32, device=device)
+
+    # ── NEW: Dynamic Simulation Time ──
+    # Run simulation until POC decays to 1% of its original mass
+    cfg.Total_Time = float(-np.log(0.01) / state['bgc'].k_hyd) * 5.0
+    print(f"Lifecycle Time: Simulating {cfg.Total_Time:.1f} time units until POC exhaustion.")
     
     # Tracer names for easy looping
     tracer_names = ['o2', 'no3', 'doc', 'po4', 'n2o', 'n2o_ammox', 'n2o_denit', 'nh4', 'no2', 'n2']
@@ -108,7 +123,7 @@ def setup_physics(cfg):
     state['w']          = torch.zeros((bs, cfg.Nx, cfg.Ny), dtype=torch.float32, device=device)
     state['_rhs_buf_w'] = torch.zeros((bs, cfg.Nx, cfg.Ny), dtype=torch.float32, device=device)
 
-    # ── Allocate Tracers ───────────────────────────────────────────────────────
+# ── Allocate Tracers ───────────────────────────────────────────────────────
     state['tracers'] = {}
     state['_rhs_tracers'] = {}
     
@@ -123,7 +138,10 @@ def setup_physics(cfg):
             state['tracers'][name] = torch.tensor(doc_initial, device=device)
         else:
             # All other tracers (O2, NO3, etc.) fill the domain normally
-            state['tracers'][name] = torch.full((bs, cfg.Nx, cfg.Ny), init_val, dtype=torch.float32, device=device)
+            # NEW: Safely broadcast scalar or batched arrays
+            init_val_arr = b_arr(init_val)
+            init_tensor = torch.tensor(init_val_arr, dtype=torch.float32, device=device)
+            state['tracers'][name] = torch.ones((bs, cfg.Nx, cfg.Ny), dtype=torch.float32, device=device) * init_tensor
             
         state['_rhs_tracers'][name] = torch.zeros((bs, cfg.Nx, cfg.Ny), dtype=torch.float32, device=device)
     # ───────────────────────────────────────────────────────────────────────────
@@ -193,7 +211,7 @@ def get_psi_pert(w_field, state):
     return psi
 
 
-def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
+def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg, doc_flux_t):
     """Batched RHS for vorticity (Arakawa) and 8 tracers (Upwind) simultaneously."""
     p = streamfunction
 
@@ -260,17 +278,37 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
     rhs_w = J_avg + state['nu'] * lap[0] - drag
     state['_rhs_buf_w'][..., 1:-1, 1:-1] = rhs_w
 
-    # ── 3. Tracer Advection: 1st-Order Upwind Scheme ──
+    # ── 3. Tracer Advection: 2nd-Order Upwind Scheme ──
     # Isolate just the stacked tracers (indices 1 through 8)
-    t_c, t_e, t_w, t_n, t_s = f_c[1:], f_e[1:], f_w[1:], f_n[1:], f_s[1:]
+    t_full = torch.stack([tracers_dict[name] for name in tracer_names])
     
-    # Broadcast velocities so they can multiply the entire stack of 8 tracers at once
+    # Pad the tensor by 1 on all sides so we can safely sample the extended 2nd-order stencil (i-2 and i+2)
+    t_pad = torch.nn.functional.pad(t_full, (1, 1, 1, 1), mode='replicate')
+    
+    # Extract the 5-point stencil for the interior domain
+    t_c  = t_pad[..., 2:-2, 2:-2]  # Center
+    
+    t_e  = t_pad[..., 3:-1, 2:-2]  # East
+    t_ee = t_pad[..., 4:,   2:-2]  # Far East
+    t_w  = t_pad[..., 1:-3, 2:-2]  # West
+    t_ww = t_pad[..., :-4,  2:-2]  # Far West
+    
+    t_n  = t_pad[..., 2:-2, 3:-1]  # North
+    t_nn = t_pad[..., 2:-2, 4:]    # Far North
+    t_s  = t_pad[..., 2:-2, 1:-3]  # South
+    t_ss = t_pad[..., 2:-2, :-4]   # Far South
+
     u_vel = u_c.unsqueeze(0)
     v_vel = v_c.unsqueeze(0)
     
-    # Use > 0.0 instead of > 0 to prevent integer-to-float64 promotion
-    adv_x = torch.where(u_vel > 0, u_vel * (t_c - t_w) * state['inv_dx'], u_vel * (t_e - t_c) * state['inv_dx'])
-    adv_y = torch.where(v_vel > 0, v_vel * (t_c - t_s) * state['inv_dy'], v_vel * (t_n - t_c) * state['inv_dy'])
+    # 2nd-Order Upwind Derivatives
+    adv_x = torch.where(u_vel > 0, 
+                        u_vel * (3.0*t_c - 4.0*t_w + t_ww) * state['inv_2dx'],
+                        u_vel * (-t_ee + 4.0*t_e - 3.0*t_c) * state['inv_2dx'])
+                        
+    adv_y = torch.where(v_vel > 0, 
+                        v_vel * (3.0*t_c - 4.0*t_s + t_ss) * state['inv_2dy'],
+                        v_vel * (-t_nn + 4.0*t_n - 3.0*t_c) * state['inv_2dy'])
     
     # The advective flux leaving the cell
     tracer_advection = -(adv_x + adv_y)
@@ -286,7 +324,7 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg):
         rhs_t = tracer_advection[i] + state['K'] * lap[i+1] + ddt[name]
         
         if name == 'doc':
-            rhs_t += state['doc_flux'] * state['particle_mask'][..., 1:-1, 1:-1]
+            rhs_t += doc_flux_t * state['particle_mask'][..., 1:-1, 1:-1]
             
         state['_rhs_tracers'][name][..., 1:-1, 1:-1] = rhs_t
 
@@ -307,8 +345,8 @@ if hasattr(torch, 'compile'):
     try:
         get_rhs_batched = torch.compile(
             get_rhs_batched,
-            fullgraph=True,       # Fails loudly if there are graph breaks (better than silent slowdowns)
-            mode="reduce-overhead" # Reduces Python dispatch overhead per call — ideal for a loop
+            fullgraph=True,       # Fails loudly if there are graph breaks
+            mode="reduce-overhead" # Reduces Python dispatch overhead per call
         )
         print("✅ torch.compile enabled for RHS physics")
     except Exception as e:
