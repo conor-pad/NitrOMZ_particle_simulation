@@ -1,6 +1,5 @@
 import torch
 
-
 def get_n2o_yield(o2, bgc):
     """
     Converted from n2o_yield.m
@@ -8,10 +7,17 @@ def get_n2o_yield(o2, bgc):
     """
     Y = {}
     
-    if bgc.n2o_yield == 'Ji':
+    # Check if a model is specified, default to 'Ji'
+    n2o_yield_model = getattr(bgc, 'n2o_yield', 'Ji')
+    
+    if n2o_yield_model == 'Ji':
+        # Hardcoding the parameters natively so biopar.py is untouched
+        Ji_a = 0.05  # Replace with your original MATLAB value if different
+        Ji_b = 0.15  # Replace with your original MATLAB value if different
+        
         # scale original params
-        a1 = bgc.Ji_a / 100.0
-        b1 = bgc.Ji_b / 100.0
+        a1 = Ji_a / 100.0
+        b1 = Ji_b / 100.0
         
         # total yields
         Y['nn2o_nh4'] = (a1 + b1 * o2) / (a1 + (b1 + 1.0) * o2)

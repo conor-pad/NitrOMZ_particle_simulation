@@ -1,9 +1,9 @@
 # config.py
 use_symmetry = True # artifical enforced symmetry to stop the model from exploding.
 batch_size = 1      # Default for main.py (overridden by run_suite.py)
-
+snapshot_time = 1
 # ── Particle Parameters ───────────────────────────────────────────────────────
-radius = 1
+radius = 2.55
 
 # ── Domain (Scaled by radius) ─────────────────────────────────────────────────
 Lx = 20.0 * radius  
@@ -16,10 +16,10 @@ cy = Ly / 2.0
 
 # ── DOC ───────────────────────────────────────────────────────────────────────
 # doc_flux_rate = 1.0       # Hydrolysis rate: solid POC to dissolved DOC (mmol/m^3/s)
-doc_initial_core = 0.0    # Initial DOC concentration inside the particle
+doc_initial_core = 5000.0    # Initial DOC concentration inside the particle
 
 # ── Target Dimensionless Numbers ──────────────────────────────────────────────
-Sc_target = 660   
+Sc_target = 750   
 
 # ── Derived Physics Parameters ────────────────────────────────────────────────
 nu = 1.04  # Physically realistic kinematic viscosity for seawater (mm^2/s)
@@ -31,7 +31,9 @@ Re_actual = (U_bg * (2.0 * radius)) / nu
 Pe_calc = Re_actual * Sc_target  
 
 # Calculate total time based on 5x the domain length
-# Total_Time = 50#5 * Lx / U_bg
+Total_Time = 200.0 
+
+terminal_snapshot_only = False
 
 # 1. Calculate the true physical diffusivity
 K = nu / Sc_target

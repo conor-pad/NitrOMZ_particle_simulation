@@ -53,19 +53,22 @@ def setup_physics(cfg):
     # 1. Advective limit (How fast the fluid moves)
     dt_adv  = np.min(getattr(cfg, 'target_CFL', 0.2) * np.minimum(dx_b, dy_b) / U_bg)
     
-    # 2. Drag limit (How fast the particle stops the fluid)
+    # 2. Drag limit — implicit, no longer constrains dt
     dt_drag = np.min(0.5 / max_alpha) if np.max(max_alpha) > 0 else float('inf')
     
     # 3. Scalar diffusion limit (How fast the chemicals spread)
     dt_diff = np.min(0.25 * np.minimum(dx_b, dy_b)**2 / cfg.K)
     
-    # 4. Momentum diffusion limit (How fast the fluid shears/sticks)
+    # 4. Momentum diffusion limit — implicit, no longer constrains dt
     dt_visc = np.min(0.25 * np.minimum(dx_b, dy_b)**2 / cfg.nu)
 
-    # Take the absolute smallest required time step!
-    dt, min_name = min((dt_adv, "dt_adv"), (dt_drag, "dt_drag"), (dt_diff, "dt_diff"), (dt_visc, "dt_visc"))
+    # Drag and viscosity are now implicit — only advection and scalar diffusion constrain dt
+    dt, min_name = min((dt_adv, "dt_adv"), (dt_diff, "dt_diff"))
 
     print(f"Time step: {dt:.6f} (Source: {min_name})")
+    print(f"  [implicit — no longer limiting]  dt_drag={dt_drag:.6f},  dt_visc={dt_visc:.6f}")
+    if min(dt_drag, dt_visc) < dt:
+        print(f"  Effective timestep speedup vs old explicit: ~{dt / min(dt_drag, dt_visc):.1f}x")
     cfg.dt = float(dt)
 
     # Mirror the raw drag mask about y = Ny//2 before smoothing
@@ -97,16 +100,17 @@ def setup_physics(cfg):
     V_mm3 = np.pi * (radius_arr ** 2) * 1.0               # Assume 1mm cylinder height
     poc_ug = 0.99 * (V_mm3 ** 0.52)                       # Fractal scaling
     poc_mmol = poc_ug / 12010                             # Convert to mmol C
-    poc_initial_density = poc_mmol / (V_mm3 * 1e-9)       # Convert to mmol/m^3
+    
+    # ── CONDITIONAL OVERRIDE ──
+    if getattr(cfg, 'use_klawonn_density', False) and hasattr(cfg, 'poc_initial_core'):
+        poc_initial_density = np.ones((bs, 1, 1), dtype=np.float32) * float(cfg.poc_initial_core)
+    else:
+        poc_initial_density = poc_mmol / (V_mm3 * 1e-9)       # Convert to mmol/m^3
     
     # Cache constants for the physics loop
     state['k_hyd'] = torch.tensor(state['bgc'].k_hyd, dtype=torch.float32, device=device)
     state['poc_initial'] = torch.tensor(poc_initial_density, dtype=torch.float32, device=device)
 
-    # ── NEW: Dynamic Simulation Time ──
-    # Run simulation until POC decays to 1% of its original mass
-    cfg.Total_Time = float(-np.log(0.01) / state['bgc'].k_hyd) * 5.0
-    print(f"Lifecycle Time: Simulating {cfg.Total_Time:.1f} time units until POC exhaustion.")
     
     # Tracer names for easy looping
     tracer_names = ['o2', 'no3', 'doc', 'po4', 'n2o', 'n2o_ammox', 'n2o_denit', 'nh4', 'no2', 'n2']
@@ -179,6 +183,17 @@ def setup_physics(cfg):
     state['_dst_buf_axis0'] = torch.zeros((bs, 2 * (Ni + 1), Nj), dtype=torch.float32, device=device)
     state['_dst_buf_axis1'] = torch.zeros((bs, Ni, 2 * (Nj + 1)), dtype=torch.float32, device=device)
 
+    # ── Precomputed IMEX denominators (one set per SSP-RK3 stage) ────────────
+    # Stage coefficients: c=1 (stage 1), c=1/4 (stage 2), c=2/3 (stage 3)
+    #
+    # impl_drag_sN : shape [bs, Nx, Ny]  — 1 / (1 + c·dt·α(x,y))
+    # helm_denom_sN: shape [bs, Ni, Nj]  — (1 − c·dt·ν·Λ)   [always > 1, A-stable]
+    Lambda = state['Lambda']  # shape [bs, Ni, Nj], all negative
+    for tag, c in [('s1', 1.0), ('s2', 0.25), ('s3', 2.0 / 3.0)]:
+        state[f'impl_drag_{tag}'] = 1.0 / (1.0 + c * dt * state['drag_mask'])
+        state[f'helm_denom_{tag}'] = 1.0 - c * dt * cfg.nu * Lambda
+    print("✅ IMEX implicit drag + viscosity denominators precomputed.")
+
     return device, state
 
 
@@ -209,6 +224,19 @@ def get_psi_pert(w_field, state):
     psi       = torch.zeros_like(w_field)
     psi[..., 1:-1, 1:-1] = psi_inner
     return psi
+
+
+def apply_implicit_visc(w_in, helm_denom, state):
+    """
+    Solve (I − c·dt·ν·∇²) w_out = w_in on interior points via DST-I.
+    Reuses the same DST infrastructure as get_psi_pert but divides by
+    helm_denom = (1 − c·dt·ν·Λ) instead of Λ.
+    Operates on batched tensors [..., Nx, Ny].
+    Boundary values are left as-is; apply_bcs corrects them immediately after.
+    """
+    rhs_hat = dstn1(w_in[..., 1:-1, 1:-1], state)
+    w_in[..., 1:-1, 1:-1] = dstn1(rhs_hat / helm_denom, state)
+    return w_in
 
 
 def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg, doc_flux_t):
@@ -269,13 +297,13 @@ def get_rhs_batched(w_f, tracers_dict, streamfunction, state, cfg, doc_flux_t):
     u_c   = dp_ns * state['inv_2dy']
     v_c   = -dp_ew * state['inv_2dx']
 
-    # ── Vorticity Drag & Final RHS ──
-    dm  = state['drag_mask'][..., 1:-1, 1:-1]
+    # ── Vorticity Explicit RHS ──
+    # α·w and ν·∇²w are handled implicitly in loop.py (per RK3 stage).
+    # Only the nonlinear gradient-correction from spatially-varying drag stays explicit.
     dax = state['da_dx'][..., 1:-1, 1:-1]
     day = state['da_dy'][..., 1:-1, 1:-1]
     
-    drag  = dm * w_c - (day * u_c - dax * v_c)
-    rhs_w = J_avg + state['nu'] * lap[0] - drag
+    rhs_w = J_avg + (day * u_c - dax * v_c)
     state['_rhs_buf_w'][..., 1:-1, 1:-1] = rhs_w
 
     # ── 3. Tracer Advection: 2nd-Order Upwind Scheme ──
@@ -342,12 +370,13 @@ def bilinear_interp_gpu(field, px_t, py_t, cfg):
           + field[ix + 1, iy + 1] * fx         * fy)
 
 if hasattr(torch, 'compile'):
-    try:
-        get_rhs_batched = torch.compile(
-            get_rhs_batched,
-            fullgraph=True,       # Fails loudly if there are graph breaks
-            mode="reduce-overhead" # Reduces Python dispatch overhead per call
-        )
-        print("✅ torch.compile enabled for RHS physics")
-    except Exception as e:
-        print(f"⚠️  torch.compile skipped: {e}")
+    if torch.backends.mps.is_available():
+        print("⚠️  Skipping torch.compile (Apple Silicon MPS does not support the compiler's 64-bit promotion)")
+    else:
+        try:
+            # fullgraph=False: nit_sms_omz has Python dict returns + string comparison
+            # that create graph breaks — fullgraph=True would crash on those.
+            get_rhs_batched = torch.compile(get_rhs_batched, mode="reduce-overhead")
+            print("✅ torch.compile enabled for RHS physics")
+        except Exception as e:
+            print(f"⚠️  torch.compile skipped: {e}")
