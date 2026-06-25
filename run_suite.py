@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 import logging
+from matplotlib.colors import ListedColormap
 
 import config as cfg
 import bcs
@@ -23,438 +24,523 @@ warnings.filterwarnings("ignore")
 logging.getLogger("torch").setLevel(logging.ERROR)
 
 
-def run_experiment(radius_list, ext_o2_list, ext_no3_list):
-    """
-    Runs a batch of simulations.
-    Lifespan integrals are accumulated on-the-fly inside loop.py.
-    This function just unpacks them and computes normalised yields.
-    """
-    cfg.batch_size = 12
+# ═════════════════════════════════════════════════════════════════════════════
+# ── SWEEP MODE SWITCH ────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#
+#   'poc_o2'    — Initial POC density (mmol C/m³)  ×  Ambient O₂ (mmol/m³)
+#   'no3_o2'    — Ambient NO₃ (mmol/m³)            ×  Ambient O₂ (mmol/m³)
+#   'radius_poc'— Particle radius (mm)              ×  Initial POC density (mmol C/m³)
+#
+SWEEP_MODE = 'no3_o2'
 
-    # ── 1. Update Geometry & Speed (Batched Arrays) ──────────────────────────
-    cfg.radius = np.array(radius_list)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ── SWEEP AXIS DEFINITIONS ───────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#   Each mode defines N_AXIS1 × N_AXIS2 experiments on a regular grid.
+#   Anything not being swept is pulled from the FIXED PARAMETERS block below.
+
+# ── poc_o2 ───────────────────────────────────────────────────────────────────
+N_POC         = 8
+N_O2          = 8
+POC_LEVELS    = np.linspace(50_000, 800_000, N_POC).tolist()   # mmol C m⁻³
+O2_LEVELS     = np.linspace(1.0, 25.0, N_O2).tolist()          # mmol O₂ m⁻³
+
+# ── no3_o2 ───────────────────────────────────────────────────────────────────
+N_NO3         = 8
+# N_O2 reused from above (keep grids the same size by default)
+NO3_SWEEP_LEVELS = np.linspace(10, 50.0, N_NO3).tolist()      # mmol NO₃ m⁻³
+# O2_LEVELS reused
+
+# ── radius_poc ───────────────────────────────────────────────────────────────
+N_RADIUS      = 8
+# N_POC reused from above
+RADIUS_LEVELS = np.linspace(0.5, 1.25, N_RADIUS).tolist()       # mm
+# POC_LEVELS reused
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ── FIXED PARAMETERS  (values used when a variable is NOT being swept) ───────
+# ═════════════════════════════════════════════════════════════════════════════
+RADIUS_FIXED  = 1.0     # mm         — fixed for poc_o2 and no3_o2 sweeps
+NO3_FIXED     = 10.0    # mmol m⁻³   — fixed for poc_o2 and radius_poc sweeps
+O2_FIXED      = 6.0     # mmol m⁻³   — fixed for radius_poc sweep
+POC_FIXED     = 200_000 # mmol C m⁻³ — fixed for no3_o2 sweep
+
+# ── Biology & Chemistry Amplifiers (locked to optimised point) ───────────────
+BIO_AMP_LOCKED  = 150
+KHYD_AMP_LOCKED = 50
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ── SWEEP METADATA HELPER ────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
+def get_sweep_meta():
+    """
+    Returns a dict describing the active sweep so that run_experiment() and
+    generate_all_plots() can adapt without any mode-specific if/else trees.
+
+    Keys
+    ----
+    axis1_col   : DataFrame column name for the x-axis (outer loop / columns)
+    axis2_col   : DataFrame column name for the y-axis (inner loop / rows)
+    axis1_vals  : list of values for axis 1
+    axis2_vals  : list of values for axis 2
+    axis1_label : human-readable axis label  (x-axis on contour plots)
+    axis2_label : human-readable axis label  (y-axis on contour plots)
+    csv_name    : output CSV filename
+    chunk_size  : batch size (reduce for radius_poc — grid rebuilds each chunk)
+    """
+    if SWEEP_MODE == 'poc_o2':
+        return dict(
+            axis1_col    = 'Initial_POC_Density',
+            axis2_col    = 'Ext_O2',
+            axis1_vals   = POC_LEVELS,
+            axis2_vals   = O2_LEVELS,
+            axis1_label  = 'Initial POC Density (mmol C m⁻³)',
+            axis2_label  = 'Ambient O₂ (mmol O₂ m⁻³)',
+            csv_name     = 'outputs/NitrOMZ_POC_O2_Sweep.csv',
+            chunk_size   = 8,
+        )
+    elif SWEEP_MODE == 'no3_o2':
+        return dict(
+            axis1_col    = 'Ext_NO3',
+            axis2_col    = 'Ext_O2',
+            axis1_vals   = NO3_SWEEP_LEVELS,
+            axis2_vals   = O2_LEVELS,
+            axis1_label  = 'Ambient NO₃ (mmol NO₃ m⁻³)',
+            axis2_label  = 'Ambient O₂ (mmol O₂ m⁻³)',
+            csv_name     = 'outputs/NitrOMZ_NO3_O2_Sweep.csv',
+            chunk_size   = 8,
+        )
+    elif SWEEP_MODE == 'radius_poc':
+        return dict(
+            axis1_col    = 'Radius_mm',
+            axis2_col    = 'Initial_POC_Density',
+            axis1_vals   = RADIUS_LEVELS,
+            axis2_vals   = POC_LEVELS,
+            axis1_label  = 'Particle Radius (mm)',
+            axis2_label  = 'Initial POC Density (mmol C m⁻³)',
+            csv_name     = 'outputs/NitrOMZ_Radius_POC_Sweep.csv',
+            chunk_size   = 8,   # radius changes rebuild the physics grid; keep batches small
+        )
+    else:
+        raise ValueError(f"Unknown SWEEP_MODE: '{SWEEP_MODE}'. "
+                         f"Choose 'poc_o2', 'no3_o2', or 'radius_poc'.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ── EXPERIMENT RUNNER ────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_experiment(axis1_vals, axis2_vals):
+    """
+    Runs one batched chunk.  axis1/axis2 correspond to get_sweep_meta() keys.
+    The function reads SWEEP_MODE to decide which config fields to patch.
+    """
+    bs = len(axis1_vals)
+    cfg.batch_size = bs
+
+    # ── Force Suite / Early-exit Mode ────────────────────────────────────────
+    cfg.is_suite                 = True
+    cfg.extrapolate_steady_state = True
+    cfg.terminal_snapshot_only   = True
+    cfg.use_klawonn_density      = False
+    cfg.doc_initial_core         = 0.0
+
+    # ── Resolve per-experiment radius, O2, NO3, POC based on active mode ─────
+    if SWEEP_MODE == 'poc_o2':
+        radii   = np.array([RADIUS_FIXED] * bs)
+        o2_arr  = np.array(axis2_vals, dtype=np.float32)
+        no3_arr = np.array([NO3_FIXED]  * bs, dtype=np.float32)
+        poc_arr = np.array(axis1_vals,  dtype=np.float32)
+
+    elif SWEEP_MODE == 'no3_o2':
+        radii   = np.array([RADIUS_FIXED] * bs)
+        o2_arr  = np.array(axis2_vals, dtype=np.float32)
+        no3_arr = np.array(axis1_vals, dtype=np.float32)
+        poc_arr = np.array([POC_FIXED]  * bs, dtype=np.float32)
+
+    elif SWEEP_MODE == 'radius_poc':
+        radii   = np.array(axis1_vals,  dtype=np.float32)
+        o2_arr  = np.array([O2_FIXED]   * bs, dtype=np.float32)
+        no3_arr = np.array([NO3_FIXED]  * bs, dtype=np.float32)
+        poc_arr = np.array(axis2_vals,  dtype=np.float32)
+
+    # ── Apply geometry (radius-dependent, so must come before setup_physics) ─
+    cfg.radius = radii
     cfg.U_bg   = 2.2 * (cfg.radius / 1.0) ** 0.56
+    cfg.Lx     = 20.0 * cfg.radius
+    cfg.Ly     = 10.0 * cfg.radius
+    cfg.cx     = 5.0  * cfg.radius
+    cfg.cy     = cfg.Ly / 2.0
+    cfg.dx     = cfg.Lx / (cfg.Nx - 1)
+    cfg.dy     = cfg.Ly / (cfg.Ny - 1)
+    cfg.K      = float(cfg.nu / cfg.Sc_target)
 
-    cfg.Lx = 20.0 * cfg.radius
-    cfg.Ly = 10.0 * cfg.radius
-    cfg.cx = 5.0  * cfg.radius
-    cfg.cy = cfg.Ly / 2.0
-    cfg.dx = cfg.Lx / (cfg.Nx - 1)
-    cfg.dy = cfg.Ly / (cfg.Ny - 1)
-    cfg.K  = float(cfg.nu / cfg.Sc_target)
+    # ── Apply boundary conditions ─────────────────────────────────────────────
+    bcs.inflow.o2  = o2_arr .reshape(bs, 1)
+    bcs.inflow.no3 = no3_arr.reshape(bs, 1)
 
-    bcs.inflow.o2  = np.array(ext_o2_list).reshape(cfg.batch_size, 1)
-    bcs.inflow.no3 = np.array(ext_no3_list).reshape(cfg.batch_size, 1)
-
-    # Silence per-run console output
+    # ── Silence per-run console output ────────────────────────────────────────
     original_stdout = sys.stdout
     sys.stdout = open(os.devnull, 'w')
-    device, state = setup_physics(cfg)
-    results = run_simulation(state, cfg, device)
+
+    device_, state = setup_physics(cfg)
+
+    # ── Apply POC initial density ─────────────────────────────────────────────
+    poc_t = torch.tensor(poc_arr.reshape(bs, 1, 1), dtype=torch.float32, device=device_)
+    state['poc_initial'] = poc_t
+
+    # ── Apply locked amplifiers ───────────────────────────────────────────────
+    bio_amp  = torch.tensor([BIO_AMP_LOCKED]  * bs, dtype=torch.float32, device=device_).view(bs, 1, 1)
+    khyd_amp = torch.tensor([KHYD_AMP_LOCKED] * bs, dtype=torch.float32, device=device_).view(bs, 1, 1)
+
+    state['bgc'].krem  *= bio_amp
+    state['bgc'].kAo   *= bio_amp
+    state['bgc'].kNo   *= bio_amp
+    state['bgc'].kDen1 *= bio_amp
+    state['bgc'].kDen2 *= bio_amp
+    state['bgc'].kDen3 *= bio_amp
+    state['bgc'].kAx   *= bio_amp
+    state['k_hyd']      = state['bgc'].k_hyd * khyd_amp
+
+    # ── Run to steady state & extrapolate ─────────────────────────────────────
+    durations, steady_rates = run_simulation(state, cfg, device_)
+
     sys.stdout.close()
     sys.stdout = original_stdout
 
-    # ── 2. Unpack results ────────────────────────────────────────────────────
-    # run_simulation returns a 14-tuple; last element is the integrals dict
-    integrals = results[-1]   # dict of lists, each length == batch_size
-
-    # POC initial mass per batch item [bs] — shape [bs, 1, 1] on GPU, flatten here
-    poc_initial_np = state['poc_initial'].cpu().numpy()   # [bs, 1, 1]
-    particle_mask  = state['particle_mask'].cpu().numpy() # [bs, Nx, Ny]
-
+    # ── Assemble per-member metrics ───────────────────────────────────────────
     batch_metrics = []
+    for b in range(bs):
+        dur_hr = durations[b]
 
-    for b in range(cfg.batch_size):
-        # dV for this batch item (dx, dy are [bs,1,1] arrays)
-        dV_m3 = float(cfg.dx[b] * cfg.dy[b] * 1.0) * 1e-9
+        # Extrapolated totals
+        tot_n2o          = steady_rates.get('n2o_flux_out',      [0]*bs)[b] * dur_hr
+        tot_n2o_internal = steady_rates.get('n2o_internal',      [0]*bs)[b] * dur_hr
+        tot_c_consumed   = steady_rates.get('c_consumed',        [0]*bs)[b] * dur_hr
+        tot_n2           = steady_rates.get('n2_flux_out',       [0]*bs)[b] * dur_hr
 
-        # Initial POC mass (mmol)
-        p_mask_b        = particle_mask[b]
-        poc_density_b   = float(poc_initial_np[b].flat[0])   # mmol/m³
-        initial_poc_mmol = poc_density_b * float(p_mask_b.sum()) * dV_m3
+        # Core-only carbon pathways
+        tot_oxic = steady_rates.get('oxic_c', [0]*bs)[b] * dur_hr
+        tot_den1 = steady_rates.get('den1_c', [0]*bs)[b] * dur_hr
+        tot_den2 = steady_rates.get('den2_c', [0]*bs)[b] * dur_hr
+        tot_den3 = steady_rates.get('den3_c', [0]*bs)[b] * dur_hr
 
-        # ── Pull pre-integrated lifespan totals ───────────────────────────────
-        tot_n2o_flux    = integrals['n2o'][b]
-        tot_n2_flux     = integrals['n2'][b]
-        tot_c_consumed  = integrals['c_total'][b]
+        # Full-domain carbon pathways
+        tot_oxic_domain = steady_rates.get('oxic_c_domain',  [0]*bs)[b] * dur_hr
+        tot_den1_domain = steady_rates.get('den1_c_domain',  [0]*bs)[b] * dur_hr
+        tot_den2_domain = steady_rates.get('den2_c_domain',  [0]*bs)[b] * dur_hr
+        tot_den3_domain = steady_rates.get('den3_c_domain',  [0]*bs)[b] * dur_hr
+        tot_c_domain    = steady_rates.get('c_consumed_domain', [0]*bs)[b] * dur_hr
 
-        tot_n2o_internal        = integrals['n2o_internal'][b]
-        tot_n2o_plume           = integrals['n2o_plume'][b]
-        tot_n2o_ammox_internal  = integrals['n2o_ammox_internal'][b]
-        tot_n2o_denit_internal  = integrals['n2o_denit_internal'][b]
-        tot_n2o_ammox_plume     = integrals['n2o_ammox_plume'][b]
-        tot_n2o_denit_plume     = integrals['n2o_denit_plume'][b]
+        # N2O yield
+        n2o_yield_efficiency = tot_n2o / tot_c_domain if tot_c_domain > 0 else 0.0
 
-        tot_oxic_core   = integrals['oxic_core'][b]
-        tot_den1_core   = integrals['den1_core'][b]
-        tot_den2_core   = integrals['den2_core'][b]
-        tot_den3_core   = integrals['den3_core'][b]
+        # Core-only metabolic fractions
+        sum_c_core = tot_oxic + tot_den1 + tot_den2 + tot_den3
+        f_oxic = tot_oxic / sum_c_core if sum_c_core > 0 else 1.0
+        f_den1 = tot_den1 / sum_c_core if sum_c_core > 0 else 0.0
+        f_den2 = tot_den2 / sum_c_core if sum_c_core > 0 else 0.0
+        f_den3 = tot_den3 / sum_c_core if sum_c_core > 0 else 0.0
 
-        tot_oxic_plume  = integrals['oxic_plume'][b]
-        tot_den1_plume  = integrals['den1_plume'][b]
-        tot_den2_plume  = integrals['den2_plume'][b]
-        tot_den3_plume  = integrals['den3_plume'][b]
-
-        tot_o2_flux_in  = integrals['o2_flux_in'][b]
-        tot_no3_flux_in = integrals['no3_flux_in'][b]
-        tot_doc_flux_out= integrals['doc_flux_out'][b]
-        avg_anoxic_frac = integrals['anoxic_core_frac_sum'][b]  # already averaged in loop.py
-
-        # ── 3. Normalised Yields ──────────────────────────────────────────────
-        n2o_yield_efficiency = tot_n2o_flux / tot_c_consumed if tot_c_consumed > 0 else 0.0
-
-        core_c_consumed  = tot_oxic_core  + tot_den1_core  + tot_den2_core  + tot_den3_core
-        plume_c_consumed = tot_oxic_plume + tot_den1_plume + tot_den2_plume + tot_den3_plume
-
-        def safe_frac(num, denom):
-            return num / denom if denom > 0 else 0.0
-
-        frac_oxic_core  = safe_frac(tot_oxic_core,  core_c_consumed)
-        frac_den1_core  = safe_frac(tot_den1_core,  core_c_consumed)
-        frac_den2_core  = safe_frac(tot_den2_core,  core_c_consumed)
-        frac_den3_core  = safe_frac(tot_den3_core,  core_c_consumed)
-
-        frac_oxic_plume = safe_frac(tot_oxic_plume,  plume_c_consumed)
-        frac_den1_plume = safe_frac(tot_den1_plume,  plume_c_consumed)
-        frac_den2_plume = safe_frac(tot_den2_plume,  plume_c_consumed)
-        frac_den3_plume = safe_frac(tot_den3_plume,  plume_c_consumed)
+        # Full-domain metabolic fractions
+        sum_c_dom     = tot_oxic_domain + tot_den1_domain + tot_den2_domain + tot_den3_domain
+        f_oxic_domain = tot_oxic_domain / sum_c_dom if sum_c_dom > 0 else 1.0
+        f_den1_domain = tot_den1_domain / sum_c_dom if sum_c_dom > 0 else 0.0
+        f_den2_domain = tot_den2_domain / sum_c_dom if sum_c_dom > 0 else 0.0
+        f_den3_domain = tot_den3_domain / sum_c_dom if sum_c_dom > 0 else 0.0
 
         metrics = {
-            'Radius_mm':                cfg.radius[b],
-            'Speed_mms':                cfg.U_bg[b],
-            'Ext_O2':                   ext_o2_list[b],
-            'Ext_NO3':                  ext_no3_list[b],
-            'Lifespan_Days':            cfg.Total_Time,
-            'Initial_POC_mmol':         initial_poc_mmol,
-            'N2O_Total_mmol_lifetime':  tot_n2o_flux,
-            'N2_Total_mmol_lifetime':   tot_n2_flux,
-            'Avg_Anoxic_Core_Frac':     avg_anoxic_frac,
-            'N2O_Internal_mmol_lifetime': tot_n2o_internal,
-            'N2O_Plume_mmol_lifetime':    tot_n2o_plume,
-            'N2O_Yield_per_C':          n2o_yield_efficiency,
-            'Frac_Oxic_Core':           frac_oxic_core,
-            'Frac_Den1_Core':           frac_den1_core,
-            'Frac_Den2_Core':           frac_den2_core,
-            'Frac_Den3_Core':           frac_den3_core,
-            'Frac_Oxic_Plume':          frac_oxic_plume,
-            'Frac_Den1_Plume':          frac_den1_plume,
-            'Frac_Den2_Plume':          frac_den2_plume,
-            'Frac_Den3_Plume':          frac_den3_plume,
-            'Plume_N2O_Ammox':          tot_n2o_ammox_plume,
-            'Plume_N2O_Denit':          tot_n2o_denit_plume,
-            'Internal_N2O_Ammox':       tot_n2o_ammox_internal,
-            'Internal_N2O_Denit':       tot_n2o_denit_internal,
-            'O2_Flux_In_mmol_lifetime':  tot_o2_flux_in,
-            'NO3_Flux_In_mmol_lifetime': tot_no3_flux_in,
-            'DOC_Leakage_mmol_lifetime': tot_doc_flux_out,
-            'Oxic_Total':               tot_oxic_core + tot_oxic_plume,
-            'Denit1_Total':             tot_den1_core + tot_den1_plume,
-            'Denit2_Total':             tot_den2_core + tot_den2_plume,
-            'Denit3_Total':             tot_den3_core + tot_den3_plume,
+            # ── Always-present identifier columns ────────────────────────────
+            'Initial_POC_Density': poc_arr[b],
+            'Ext_O2':              float(o2_arr[b]),
+            'Radius_mm':           float(radii[b]),
+            'Ext_NO3':             float(no3_arr[b]),
+            # ── Core results ─────────────────────────────────────────────────
+            'Anoxia_Duration_hr':          dur_hr,
+            'Resp_Rate_nmol_C_mm3_hr':     steady_rates.get('resp_rate', [0]*bs)[b],
+            # ── N2O budget ───────────────────────────────────────────────────
+            'N2O_Net_Domain_SMS_mmol':     tot_n2o,
+            'N2O_Net_Core_SMS_mmol':       tot_n2o_internal,
+            'N2O_Yield_molN2O_per_molC':   n2o_yield_efficiency,
+            'N2_Net_Domain_SMS_mmol':      tot_n2,
+            # ── Carbon consumed ──────────────────────────────────────────────
+            'C_Consumed_Core_mmol':        tot_c_consumed,
+            # ── Core-only pathway fractions and totals ───────────────────────
+            'Frac_Oxic_Core':  f_oxic,
+            'Frac_Den1_Core':  f_den1,
+            'Frac_Den2_Core':  f_den2,
+            'Frac_Den3_Core':  f_den3,
+            'Oxic_C_Core_mmol': tot_oxic,
+            'Den1_C_Core_mmol': tot_den1,
+            'Den2_C_Core_mmol': tot_den2,
+            'Den3_C_Core_mmol': tot_den3,
+            # ── Full-domain pathway fractions and totals ─────────────────────
+            'Frac_Oxic_Domain':  f_oxic_domain,
+            'Frac_Den1_Domain':  f_den1_domain,
+            'Frac_Den2_Domain':  f_den2_domain,
+            'Frac_Den3_Domain':  f_den3_domain,
+            'Oxic_C_Domain_mmol': tot_oxic_domain,
+            'Den1_C_Domain_mmol': tot_den1_domain,
+            'Den2_C_Domain_mmol': tot_den2_domain,
+            'Den3_C_Domain_mmol': tot_den3_domain,
+            'C_Consumed_Domain_mmol': tot_c_domain,
+            # ── Boundary fluxes ──────────────────────────────────────────────
+            'O2_Consumed_Core_mmol':  steady_rates.get('o2_flux_in',   [0]*bs)[b] * dur_hr,
+            'NO3_Consumed_Core_mmol': steady_rates.get('no3_flux_in',  [0]*bs)[b] * dur_hr,
+            'DOC_Leakage_Core_mmol':  steady_rates.get('doc_leakage',  [0]*bs)[b] * dur_hr,
         }
         batch_metrics.append(metrics)
 
     return batch_metrics
 
 
-# ── Plotting ──────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# ── PLOTTING ─────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def generate_all_plots(csv_filename):
-    df = pd.read_csv(csv_filename)
+    df   = pd.read_csv(csv_filename)
+    meta = get_sweep_meta()
+
+    ax1_col   = meta['axis1_col']    # x-axis on 2-D contour plots
+    ax2_col   = meta['axis2_col']    # y-axis on 2-D contour plots
+    ax1_label = meta['axis1_label']
+    ax2_label = meta['axis2_label']
+    ax1_vals  = meta['axis1_vals']
+    ax2_vals  = meta['axis2_vals']
+
+    # Blank resp-rate for non-anoxic rows (undefined there)
+    dead_zone = df['Anoxia_Duration_hr'] == 0.0
+    if 'Resp_Rate_nmol_C_mm3_hr' in df.columns:
+        df.loc[dead_zone, 'Resp_Rate_nmol_C_mm3_hr'] = np.nan
+
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
     plt.rcParams.update({'font.weight': 'bold', 'axes.labelweight': 'bold'})
 
-    available_no3 = df['Ext_NO3'].unique()
-    available_o2  = df['Ext_O2'].unique()
+    print(f"\n📊 Generating {SWEEP_MODE} sweep plots…")
 
-    base_no3 = available_no3[0] if len(available_no3) == 1 else (10.0 if 10.0 in available_no3 else available_no3[0])
-    base_o2  = available_o2[0]  if len(available_o2)  == 1 else (6.0  if 6.0  in available_o2  else available_o2[0])
+    # ── Shared helpers ────────────────────────────────────────────────────────
 
-    print(f"\n📊 Plotting Baselines -> O2: {base_o2}, NO3: {base_no3}")
+    def plot_contour(values_col, title, cbar_label, filename, cmap='viridis'):
+        """
+        Generic 2-D filled-contour plot.  Pivot uses ax2 as the row index
+        (y-axis) and ax1 as the column index (x-axis) — matching the live
+        axis label assignments above.
+        """
+        plt.figure(figsize=(9, 6))
+        pivot = df.pivot_table(index=ax2_col, columns=ax1_col,
+                               values=values_col, dropna=False)
+        X, Y = np.meshgrid(pivot.columns, pivot.index)
+        Z    = pivot.values
 
-    # ── PLOT 1: Normalised N2O Yield Contour ─────────────────────────────────
-    plt.figure(figsize=(9, 6))
-    df_p1  = df[df['Ext_NO3'] == base_no3]
-    pivot1 = df_p1.pivot(index='Ext_O2', columns='Radius_mm', values='N2O_Yield_per_C')
-    X1, Y1 = np.meshgrid(pivot1.columns, pivot1.index)
-    Z1     = pivot1.values
+        min_z = np.nanmin(Z)
+        max_z = np.nanmax(Z)
 
-    cf1  = plt.contourf(X1, Y1, Z1, levels=20, cmap='viridis')
-    cbar1 = plt.colorbar(cf1)
-    cbar1.set_label('Total Lifespan N2O Yield\n(mmol N2O / mmol Total C metabolized)')
-    plt.scatter(X1, Y1, color='black', s=15, alpha=0.5, zorder=5)
-    plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Ambient O2 (mmol/m3)")
-    plt.title(f"N2O Production Efficiency (Core + Plume) | NO3 = {base_no3}",
-              fontsize=14, fontweight='bold', pad=15)
-    plt.tight_layout()
-    plt.savefig("outputs/Plot1_N2O_Yield.png", dpi=300, bbox_inches='tight')
-    plt.close()
+        if min_z <= 0.0 and max_z > 0.0:
+            eps    = max_z * 1e-5
+            levels = [0.0, eps] + list(np.linspace(eps, max_z, 20))[1:]
+            cf     = plt.contourf(X, Y, Z, levels=levels, cmap=cmap)
+            c_line = plt.contour(X, Y, Z, levels=[eps],
+                                 colors='cyan', linewidths=2, linestyles='dashed')
+            plt.clabel(c_line, inline=True, fontsize=10, fmt='Zero Boundary')
+        else:
+            cf = plt.contourf(X, Y, Z, levels=20, cmap=cmap)
 
-    # ── Calculate Total Fractions ──────────────────────────────────────────────
-    if 'Frac_Oxic_Total' not in df.columns:
-        tot = df['Oxic_Total'] + df['Denit1_Total'] + df['Denit2_Total'] + df['Denit3_Total']
-        df['Frac_Oxic_Total'] = df['Oxic_Total'] / tot
-        df['Frac_Den1_Total'] = df['Denit1_Total'] / tot
-        df['Frac_Den2_Total'] = df['Denit2_Total'] / tot
-        df['Frac_Den3_Total'] = df['Denit3_Total'] / tot
+        cbar = plt.colorbar(cf)
+        cbar.set_label(cbar_label)
+        plt.scatter(X, Y, color='white', edgecolor='black', s=20, alpha=0.8, zorder=5)
+        plt.xlabel(ax1_label)
+        plt.ylabel(ax2_label)
+        plt.title(title, fontsize=14, fontweight='bold', pad=15)
+        plt.tight_layout()
+        plt.savefig(f'outputs/{filename}', dpi=300, bbox_inches='tight')
+        plt.close()
 
-    def get_melted_fractions(df_in, zone_suffix, x_var):
-        cols = [f'Frac_Oxic_{zone_suffix}', f'Frac_Den1_{zone_suffix}', 
-                f'Frac_Den2_{zone_suffix}', f'Frac_Den3_{zone_suffix}']
-        melted = df_in.melt(id_vars=[x_var], value_vars=cols, 
-                            var_name='Pathway', value_name='Fraction')
-        melted['Pathway'] = melted['Pathway'].str.replace('Frac_', '').str.replace(f'_{zone_suffix}', '')
-        return melted
-
-    # ── PLOT 2: Fraction vs Radius (Fixed O2) ────────────────────────────────
-    base_o2 = 1.0
-    base_no3 = 10.0
-    df_p2 = df[(df['Ext_O2'] == base_o2) & (df['Ext_NO3'] == base_no3)].copy()
-
-    df_core2 = get_melted_fractions(df_p2, 'Core', 'Radius_mm')
-    df_tot2  = get_melted_fractions(df_p2, 'Total', 'Radius_mm')
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    sns.lineplot(data=df_core2, x='Radius_mm', y='Fraction', hue='Pathway', marker="s", linewidth=2.5, ax=axes[0])
-    axes[0].set_title("Core Only (Inside Particle)", fontweight='bold')
-    axes[0].set_xlabel("Particle Radius (mm)")
-    axes[0].set_ylabel("Fraction of DOC Consumed")
-
-    sns.lineplot(data=df_tot2, x='Radius_mm', y='Fraction', hue='Pathway', marker="s", linewidth=2.5, ax=axes[1])
-    axes[1].set_title("Total Domain (Core + Plume)", fontweight='bold')
-    axes[1].set_xlabel("Particle Radius (mm)")
-
-    plt.suptitle(f"Metabolic Partitioning vs. Radius (O2={base_o2}, NO3={base_no3})", fontsize=16, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig("outputs/Plot2_Metabolism_vs_Radius.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # ── PLOT 3: Fraction vs Ambient O2 (Fixed Radius) ────────────────────────
-    base_radius = 1.0
-    df_p3 = df[(df['Radius_mm'] == base_radius) & (df['Ext_NO3'] == base_no3)].copy()
-
-    df_core3 = get_melted_fractions(df_p3, 'Core', 'Ext_O2')
-    df_tot3  = get_melted_fractions(df_p3, 'Total', 'Ext_O2')
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
-    sns.lineplot(data=df_core3, x='Ext_O2', y='Fraction', hue='Pathway', marker="o", linewidth=2.5, ax=axes[0])
-    axes[0].set_title("Core Only (Inside Particle)", fontweight='bold')
-    axes[0].set_xlabel("Ambient O2 (mmol/m³)")
-    axes[0].set_ylabel("Fraction of DOC Consumed")
-
-    sns.lineplot(data=df_tot3, x='Ext_O2', y='Fraction', hue='Pathway', marker="o", linewidth=2.5, ax=axes[1])
-    axes[1].set_title("Total Domain (Core + Plume)", fontweight='bold')
-    axes[1].set_xlabel("Ambient O2 (mmol/m³)")
-
-    plt.suptitle(f"Metabolic Partitioning vs. Ambient O2 (Radius={base_radius}mm, NO3={base_no3})", fontsize=16, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig("outputs/Plot3_Metabolism_vs_O2.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    # ── PLOT 4 (Residence Time removed — invalid for transient lifecycle) ──
-
-    # ── PLOT 4/5 REPLACEMENT: N2O Source Apportionment Contours ──────────────
-    plt.figure(figsize=(14, 10))
-
-    sources = ['Internal_N2O_Ammox', 'Internal_N2O_Denit',
-               'Plume_N2O_Ammox', 'Plume_N2O_Denit']
-    titles = ['Inside Particle (Core Ammox)', 'Inside Particle (Core Denitrification)',
-              'Outside Particle (Plume Ammox)', 'Outside Particle (Plume Denitrification)']
-
-    for i, (col, title) in enumerate(zip(sources, titles), 1):
-        plt.subplot(2, 2, i)
-
-        pivot_data = df.pivot_table(index='Ext_O2', columns='Radius_mm', values=col)
-        X, Y = np.meshgrid(pivot_data.columns, pivot_data.index)
-        Z = pivot_data.values
-
-        cf = plt.contourf(X, Y, Z, levels=20, cmap='inferno')
-        cbar = plt.colorbar(cf, format="%.1e")
-        cbar.set_label('Total Lifespan N2O (mmol)')
-
+    def plot_fractions_vs_axis(df_slice, x_col, frac_cols, pathway_labels,
+                               title, xlabel, filename, marker):
+        """Line plot of four metabolic-pathway fractions against one axis."""
+        melted           = df_slice.melt(id_vars=[x_col], value_vars=frac_cols,
+                                         var_name='Pathway', value_name='Fraction')
+        melted['Pathway'] = melted['Pathway'].map(dict(zip(frac_cols, pathway_labels)))
+        plt.figure(figsize=(8, 6))
+        sns.lineplot(data=melted, x=x_col, y='Fraction',
+                     hue='Pathway', marker=marker, linewidth=2.5)
         plt.title(title, fontweight='bold')
-        plt.xlabel("Particle Radius (mm)")
-        plt.ylabel("Ambient O2 (mmol/m³)")
-        plt.gca().invert_yaxis()
+        plt.xlabel(xlabel)
+        plt.ylabel('Fraction of Total Carbon Consumed')
+        plt.tight_layout()
+        plt.savefig(f'outputs/{filename}', dpi=300)
+        plt.close()
 
-    plt.suptitle("N2O Source Apportionment across all O2 Levels", fontsize=16, fontweight='bold', y=1.02)
-    plt.tight_layout()
-    plt.savefig("outputs/Plot4_N2O_Sources_Contours.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    # ── Mid-point slices for line plots (Dynamic from CSV) ─────────────
+    unique_ax1 = np.sort(df[ax1_col].dropna().unique())
+    unique_ax2 = np.sort(df[ax2_col].dropna().unique())
+    
+    # Find the closest actual value in the dataset to the true center
+    median_ax1 = unique_ax1[len(unique_ax1) // 2]
+    median_ax2 = unique_ax2[len(unique_ax2) // 2]   
 
-    # ── PLOT 6: Boundary Layer Exchange Fluxes ────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    frac_domain_cols = ['Frac_Oxic_Domain', 'Frac_Den1_Domain',
+                        'Frac_Den2_Domain', 'Frac_Den3_Domain']
+    frac_core_cols   = ['Frac_Oxic_Core',   'Frac_Den1_Core',
+                        'Frac_Den2_Core',   'Frac_Den3_Core']
+    pathway_labels   = ['Oxic (O₂)', 'Den1 (NO₃→NO₂)',
+                        'Den2 (NO₂→N₂O)', 'Den3 (N₂O→N₂)']
 
-    sns.lineplot(data=df, x='Ext_O2', y='O2_Flux_In_mmol_lifetime', hue='Radius_mm',
-                 palette='viridis', marker='o', linewidth=2.5, ax=axes[0])
-    axes[0].set_title('Total O2 Consumed from Ambient', fontweight='bold')
-    axes[0].set_xlabel('Ambient O2 (mmol/m3)')
-    axes[0].set_ylabel('Total O2 Influx (mmol)')
-    axes[0].grid(True, linestyle='--', alpha=0.7)
+    # ── Plot 1: N₂O yield, full domain ───────────────────────────────────────
+    plot_contour(
+        'N2O_Yield_molN2O_per_molC',
+        f'Plot 1: Net N₂O Production per Carbon Consumed\n'
+        f'(Full Domain: core + plume; Den3 consumption subtracted)',
+        'mol N₂O mol C⁻¹', 'Plot1_N2O_Yield_Norm.png', 'viridis')
 
-    sns.lineplot(data=df, x='Ext_NO3', y='NO3_Flux_In_mmol_lifetime', hue='Radius_mm',
-                 palette='flare', marker='s', linewidth=2.5, ax=axes[1])
-    axes[1].set_title('Total NO3 Consumed from Ambient', fontweight='bold')
-    axes[1].set_xlabel('Ambient NO3 (mmol/m3)')
-    axes[1].set_ylabel('Total NO3 Influx (mmol)')
-    axes[1].grid(True, linestyle='--', alpha=0.7)
+    # ── Plot 2: Absolute net domain N₂O ──────────────────────────────────────
+    plot_contour(
+        'N2O_Net_Domain_SMS_mmol',
+        f'Plot 2: Net Domain-Integrated N₂O SMS Over Particle Lifetime\n'
+        f'(Full Domain: core + plume; production minus Den3 consumption; mmol N₂O)',
+        'mmol N₂O', 'Plot2_N2O_Domain_Net.png', 'magma')
 
-    sns.lineplot(data=df, x='Ext_O2', y='DOC_Leakage_mmol_lifetime', hue='Radius_mm',
-                 palette='copper', marker='^', linewidth=2.5, ax=axes[2])
-    axes[2].set_title('Total DOC Lost to Plume', fontweight='bold')
-    axes[2].set_xlabel('Ambient O2 (mmol/m3)')
-    axes[2].set_ylabel('Total DOC Leakage (mmol)')
-    axes[2].grid(True, linestyle='--', alpha=0.7)
+    # ── Plot 3: Anoxia duration ───────────────────────────────────────────────
+    plot_contour(
+        'Anoxia_Duration_hr',
+        f'Plot 3: Predicted Particle Anoxic Core Duration\n'
+        f'(hr; onset = min core O₂ < 0.3 mmol m⁻³; end extrapolated from fuel burn rate)',
+        'Duration (hr)', 'Plot3_Anoxia_Duration.png', 'inferno')
 
-    plt.tight_layout()
-    plt.savefig("outputs/Plot5_Boundary_Fluxes.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    # ── Plot 4: Full-domain fractions vs axis 2 (at median axis 1) ───────────
+    df_p4 = df[df[ax1_col] == median_ax1].copy()
+    plot_fractions_vs_axis(
+        df_p4, ax2_col, frac_domain_cols, pathway_labels,
+        f'Plot 4: Full-Domain Carbon Pathway Fractions vs. {ax2_label.split("(")[0].strip()}\n'
+        f'(Core + plume; fixed {ax1_label.split("(")[0].strip()} = {median_ax1:.4g})',
+        ax2_label,
+        'Plot4_Domain_Fractions_vs_Axis2.png', 'o')
 
-    # ── PLOT 7: Absolute N2O Flux — Internal Core Only ────────────────────────
+    # ── Plot 5: Full-domain fractions vs axis 1 (at median axis 2) ───────────
+    df_p5 = df[df[ax2_col] == median_ax2].copy()
+    plot_fractions_vs_axis(
+        df_p5, ax1_col, frac_domain_cols, pathway_labels,
+        f'Plot 5: Full-Domain Carbon Pathway Fractions vs. {ax1_label.split("(")[0].strip()}\n'
+        f'(Core + plume; fixed {ax2_label.split("(")[0].strip()} = {median_ax2:.4g})',
+        ax1_label,
+        'Plot5_Domain_Fractions_vs_Axis1.png', 's')
+
+    # ── Plot 6: Core fractions vs axis 2 (at median axis 1) ──────────────────
+    df_p6 = df[df[ax1_col] == median_ax1].copy()
+    plot_fractions_vs_axis(
+        df_p6, ax2_col, frac_core_cols, pathway_labels,
+        f'Plot 6: Particle Core Carbon Pathway Fractions vs. {ax2_label.split("(")[0].strip()}\n'
+        f'(Inside particle mask; fixed {ax1_label.split("(")[0].strip()} = {median_ax1:.4g})',
+        ax2_label,
+        'Plot6_Core_Fractions_vs_Axis2.png', 'o')
+
+    # ── Plot 7: Core fractions vs axis 1 (at median axis 2) ──────────────────
+    df_p7 = df[df[ax2_col] == median_ax2].copy()
+    plot_fractions_vs_axis(
+        df_p7, ax1_col, frac_core_cols, pathway_labels,
+        f'Plot 7: Particle Core Carbon Pathway Fractions vs. {ax1_label.split("(")[0].strip()}\n'
+        f'(Inside particle mask; fixed {ax2_label.split("(")[0].strip()} = {median_ax2:.4g})',
+        ax1_label,
+        'Plot7_Core_Fractions_vs_Axis1.png', 's')
+
+    # ── Plot 8: Net N₂O SMS inside particle core ──────────────────────────────
     plt.figure(figsize=(9, 6))
-    df_p7  = df[df['Ext_NO3'] == base_no3]
-    pivot7 = df_p7.pivot(index='Ext_O2', columns='Radius_mm', values='N2O_Internal_mmol_lifetime')
-    X7, Y7 = np.meshgrid(pivot7.columns, pivot7.index)
-    Z7     = pivot7.values
-
-    max_abs = max(abs(np.nanmax(Z7)), abs(np.nanmin(Z7)))
-    if max_abs == 0:
-        max_abs = 1e-10
-
-    cf7  = plt.contourf(X7, Y7, Z7, levels=30, cmap='RdBu_r', vmin=-max_abs, vmax=max_abs)
-    cbar7 = plt.colorbar(cf7)
-    cbar7.set_label('Total Internal Core N2O (mmol)\n<-- Net Consumption   |   Net Production -->')
-    plt.contour(X7, Y7, Z7, levels=[0], colors='black', linewidths=2)
-    plt.scatter(X7, Y7, color='black', s=15, alpha=0.5, zorder=5)
-    plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Ambient O2 (mmol/m3)")
-    plt.title(f"Total Internal N2O Generated (Inside Particle Core Only) | NO3 = {base_no3}",
-              fontsize=14, fontweight='bold', pad=15)
+    pivot8 = df.pivot_table(index=ax2_col, columns=ax1_col,
+                            values='N2O_Net_Core_SMS_mmol', dropna=False)
+    X8, Y8 = np.meshgrid(pivot8.columns, pivot8.index)
+    Z8     = pivot8.values
+    vmax8  = np.nanmax(np.abs(Z8)) if np.any(np.isfinite(Z8)) else 1.0
+    cf8    = plt.contourf(X8, Y8, Z8, levels=20,
+                          cmap='RdBu_r', vmin=-vmax8, vmax=vmax8)
+    cbar8  = plt.colorbar(cf8)
+    cbar8.set_label('mmol N₂O  (+ = net source  ▲,  − = net sink  ▼)')
+    plt.scatter(X8, Y8, color='black', s=10, alpha=0.3, zorder=5)
+    plt.xlabel(ax1_label)
+    plt.ylabel(ax2_label)
+    plt.title('Plot 8: Net N₂O SMS Inside Particle Core Over Particle Lifetime\n'
+              '(Particle mask only; N₂O production [ammox + Den2] minus '
+              'N₂O consumption [Den3]; mmol N₂O)',
+              fontsize=13, fontweight='bold', pad=15)
     plt.tight_layout()
-    plt.savefig("outputs/Plot6_Internal_Flux_Only.png", dpi=300, bbox_inches='tight')
+    plt.savefig('outputs/Plot8_Core_N2O_Net_SMS.png', dpi=300, bbox_inches='tight')
     plt.close()
 
-    # ── PLOT 8: Anoxic "Dead Core" Fraction ──────────────────────────────────
-    plt.figure(figsize=(8, 6))
-    sns.lineplot(data=df, x='Radius_mm', y='Avg_Anoxic_Core_Frac', hue='Ext_O2',
-                 marker="s", linewidth=2.5, palette="crest")
-    plt.title("Time-Averaged Anoxic Core Fraction", fontweight='bold')
-    plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Lifespan Avg Core Volume (< 1.0 mmol/m3 O2)")
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(title="Ambient O2 (mmol/m3)")
-    plt.tight_layout()
-    plt.savefig("outputs/Plot7_Anoxic_Core.png", dpi=300, bbox_inches='tight')
-    plt.close()
+    # ── Plot 9: Steady-state respiration rate ─────────────────────────────────
+    plot_contour(
+        'Resp_Rate_nmol_C_mm3_hr',
+        'Plot 9: Steady-State Microbial Respiration Rate Inside Particle Core\n'
+        '(Particle mask only; ΣRemOx + ΣDen1 + ΣDen2 + ΣDen3 at extrapolation '
+        'snapshot; nmol C mm⁻³ hr⁻¹)',
+        'nmol C mm⁻³ hr⁻¹', 'Plot9_Core_Resp_Rate.png', 'cividis')
 
-    # ── PLOT 9: Terminal N2/N2O Ratio ─────────────────────────────────────────
-    df['Terminal_Ratio'] = df['N2_Total_mmol_lifetime'] / (df['N2O_Total_mmol_lifetime'] + 1e-12)
-    df_ratio = df[df['Ext_NO3'] == base_no3]
-
-    plt.figure(figsize=(8, 6))
-    sns.lineplot(data=df_ratio, x='Radius_mm', y='Terminal_Ratio', hue='Ext_O2',
-                 marker="D", linewidth=2.5, palette="rocket")
-    plt.axhline(1.0, color='black', linestyle='--', linewidth=1.5, zorder=0)
-    plt.yscale('log')
-    plt.title(f"Total Lifespan N2/N2O Ratio (Core + Plume, NO3={base_no3})", fontweight='bold')
-    plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Total System N2 / N2O Ratio (Log Scale)")
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(title="Ambient O2 (mmol/m3)")
-    plt.tight_layout()
-    plt.savefig("outputs/Plot8_Terminal_Ratio.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # ── PLOT 10 REPLACEMENT: Dominant Metabolic Regime Map ───────────────────
+    # ── Plot 10: Dominant pathway regime map ──────────────────────────────────
     plt.figure(figsize=(10, 8))
-    
-    # Define the pathways we are comparing
-    path_cols = ['Oxic_Total', 'Denit1_Total', 'Denit2_Total', 'Denit3_Total']
-    
-    # Find the index of the maximum pathway for each row (0=Oxic, 1=Den1, 2=Den2, 3=Den3)
-    df['Dominant_Pathway_Idx'] = df[path_cols].values.argmax(axis=1)
-    
-    # Pivot into a 2D grid for the contour
-    pivot_dom = df.pivot_table(index='Ext_O2', columns='Radius_mm', values='Dominant_Pathway_Idx')
-    X, Y = np.meshgrid(pivot_dom.columns, pivot_dom.index)
-    
-    # Custom discrete colormap
-    from matplotlib.colors import ListedColormap
-    cmap_custom = ListedColormap(['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']) # Blue, Orange, Green, Red
-    
-    cf = plt.contourf(X, Y, pivot_dom.values, levels=[-0.5, 0.5, 1.5, 2.5, 3.5], cmap=cmap_custom)
-    
-    cbar = plt.colorbar(cf, ticks=[0, 1, 2, 3])
-    cbar.ax.set_yticklabels(['Oxic', 'Denit 1 (NO3->NO2)', 'Denit 2 (NO2->N2O)', 'Denit 3 (N2O->N2)'])
-    cbar.set_label('Dominant Carbon Sink')
-    
-    plt.title("Dominant Metabolic Regime (Total Domain)", fontweight='bold')
-    plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Ambient O2 (mmol/m³)")
-    plt.gca().invert_yaxis()
-    
+    core_path_cols = ['Oxic_C_Core_mmol', 'Den1_C_Core_mmol',
+                      'Den2_C_Core_mmol', 'Den3_C_Core_mmol']
+    df['Dominant_Core_Pathway_Idx'] = df[core_path_cols].values.argmax(axis=1)
+    pivot10 = df.pivot_table(index=ax2_col, columns=ax1_col,
+                             values='Dominant_Core_Pathway_Idx', dropna=False)
+    X10, Y10    = np.meshgrid(pivot10.columns, pivot10.index)
+    cmap_custom = ListedColormap(['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728'])
+    cf10        = plt.contourf(X10, Y10, pivot10.values,
+                               levels=[-0.5, 0.5, 1.5, 2.5, 3.5], cmap=cmap_custom)
+    cbar10      = plt.colorbar(cf10, ticks=[0, 1, 2, 3])
+    cbar10.ax.set_yticklabels(['Oxic (O₂)', 'Den1 (NO₃→NO₂)',
+                               'Den2 (NO₂→N₂O)', 'Den3 (N₂O→N₂)'])
+    cbar10.set_label('Dominant Carbon-Consuming Pathway')
+    plt.title('Plot 10: Dominant Carbon-Consuming Pathway Inside Particle Core\n'
+              '(argmax of lifetime-integrated C consumed per pathway, '
+              'particle mask only)',
+              fontweight='bold')
+    plt.xlabel(ax1_label)
+    plt.ylabel(ax2_label)
     plt.tight_layout()
-    plt.savefig("outputs/Plot10_Regime_Map.png", dpi=300)
+    plt.savefig('outputs/Plot10_Core_Dominant_Pathway.png', dpi=300)
     plt.close()
 
-    # ── PLOT 11: Absolute N2O Produced (Entire Domain) ───────────────────────
-    plt.figure(figsize=(10, 8))
-    pivot_abs = df.pivot_table(index='Ext_O2', columns='Radius_mm',
-                               values='N2O_Total_mmol_lifetime')
-    
-    # annot_kws overrides the global bold/large font for the grid text
-    sns.heatmap(pivot_abs, cmap="magma", annot=True, fmt=".1e",
-                annot_kws={"size": 7, "weight": "normal"}, 
-                cbar_kws={'label': 'Absolute N2O (mmols)'})
-    
-    plt.title("Total Absolute N2O Escaped into Domain", fontweight='bold')
-    plt.xlabel("Particle Radius (mm)")
-    plt.ylabel("Ambient O2 (mmol/m³)")
-    plt.gca().invert_yaxis()
-    plt.tight_layout()
-    plt.savefig("outputs/Plot11_Absolute_N2O.png", dpi=300)
-    plt.close()
-    print("✅ All plots generated successfully!")
+    print('✅ All plots generated successfully!')
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# ── ENTRY POINT ──────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    print("🌊 Starting NitrOMZ Parameter Suite...\n")
-    cfg.terminal_snapshot_only = True
+    meta         = get_sweep_meta()
+    ax1_col      = meta['axis1_col']
+    ax2_col      = meta['axis2_col']
+    ax1_vals     = meta['axis1_vals']
+    ax2_vals     = meta['axis2_vals']
+    csv_filename = meta['csv_name']
+    chunk_size   = meta['chunk_size']
 
-    radii      = np.round(np.linspace(0.1, 1.5, 10), 2).tolist()
-    o2_levels  = [1, 2.0, 3, 4, 5.0, 7.5, 10.0, 12.5, 15, 22.5, 37.5, 50]
-    no3_levels = [10.0]
+    n_total = len(ax1_vals) * len(ax2_vals)
+    print(f"🌊 NitrOMZ Suite  |  mode: {SWEEP_MODE}  |  {len(ax1_vals)} × {len(ax2_vals)} = {n_total} experiments\n")
 
-    chunk_size   = 12
-    out_dir      = "outputs"
-    os.makedirs(out_dir, exist_ok=True)
-    csv_filename = "outputs/NitrOMZ_Suite.csv"
-
-    print(f"🆕 Starting a fresh suite. Saving to '{csv_filename}'...\n")
+    os.makedirs('outputs', exist_ok=True)
+    print(f"🆕 Starting fresh suite → '{csv_filename}'\n")
     results_data = []
 
-    run_configs = [(r, o2, no3) for r in radii for o2 in o2_levels for no3 in no3_levels]
-    run_configs.sort(key=lambda x: x[0])   # group similar timestep sizes
-    total_configs = len(run_configs)
+    # Build the full grid: outer = axis1 (columns), inner = axis2 (rows)
+    run_configs = [(a1, a2) for a1 in ax1_vals for a2 in ax2_vals]
 
-    print(f"📦 Batching enabled: {chunk_size} parallel experiments per chunk.\n")
+    print(f"📦 Batch size: {chunk_size} parallel experiments per chunk.\n")
 
-    with tqdm(total=total_configs, desc="Simulating Parameters", unit="run",
+    with tqdm(total=n_total, desc='Simulating Parameters', unit='run',
               bar_format='{desc}: {percentage:3.0f}%|{bar:50}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
 
-        for i in range(0, total_configs, chunk_size):
-            batch = run_configs[i: i + chunk_size]
+        for i in range(0, n_total, chunk_size):
+            batch      = run_configs[i: i + chunk_size]
+            ax1_batch  = [b[0] for b in batch]
+            ax2_batch  = [b[1] for b in batch]
 
-            r_str = ", ".join([f"{b[0]}" for b in batch])
-            tqdm.write(f"▶ Chunk {i//chunk_size + 1}/{(total_configs + chunk_size - 1)//chunk_size} | Radii: [{r_str}] mm")
-
-            r_batch   = [b[0] for b in batch]
-            o2_batch  = [b[1] for b in batch]
-            no3_batch = [b[2] for b in batch]
-
-            batched_results = run_experiment(r_batch, o2_batch, no3_batch)
+            batched_results = run_experiment(ax1_batch, ax2_batch)
             results_data.extend(batched_results)
 
             temp_df = pd.DataFrame(results_data)
@@ -462,12 +548,12 @@ def main():
             pbar.update(len(batch))
 
     final_df = pd.DataFrame(results_data)
-    final_df = final_df.sort_values(by=['Radius_mm', 'Ext_O2', 'Ext_NO3'])
+    final_df = final_df.sort_values(by=[ax1_col, ax2_col])
     final_df.to_csv(csv_filename, index=False)
 
-    print(f"\n✅ Suite Complete! Results saved to {csv_filename}")
+    print(f'\n✅ Suite complete!  Results → {csv_filename}')
     generate_all_plots(csv_filename)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

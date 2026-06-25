@@ -31,6 +31,7 @@ def get_n2o_yield(o2, bgc):
         Y['no2_nden_nh4']  = -Y['nn2o_nden_nh4']  # nh4->no2->n2o
         
         # get yields for Hydroxylamine pathway by difference
-        Y['no2_hx_nh4'] = 1.0 - Y['nn2o_hx_nh4'] - Y['nn2o_nden_nh4']
+        # Y['no2_hx_nh4'] = 1.0 - Y['nn2o_hx_nh4'] - Y['nn2o_nden_nh4']
+        Y['no2_hx_nh4'] = torch.clamp(1.0 - Y['nn2o_hx_nh4'] - Y['nn2o_nden_nh4'], min=0.0)
         
     return Y

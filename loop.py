@@ -59,11 +59,11 @@ def run_simulation(state, cfg, device):
 
     particle_mask = state['particle_mask']   # [bs, Nx, Ny]
     plume_mask    = 1.0 - particle_mask
-    oxic_threshold = 1.0
+    oxic_threshold = 0.3
     acc_steps      = 0
 
     # ── Suite-mode extrapolation state ───────────────────────────────────────
-    equilibration_time = 20.0          # physical seconds before we start checking
+    equilibration_time = 30.0          # physical seconds before we start checking
 
     # Check every ~30 physical seconds regardless of dt.
     # With a 5-sample window this means the first extrapolation attempt fires
@@ -77,6 +77,28 @@ def run_simulation(state, cfg, device):
         final_durations_b = torch.zeros(bs, dtype=torch.float32, device=device)
         final_rates_b     = torch.zeros(bs, dtype=torch.float32, device=device)
         fuel_history_b    = [] 
+
+    steady_rates_dict = {
+            'resp_rate': torch.zeros(bs, device=device),
+            'n2o_flux_out': torch.zeros(bs, device=device),
+            'n2o_internal': torch.zeros(bs, device=device),
+            'n2_flux_out': torch.zeros(bs, device=device),
+            # ── core-only carbon pathways (mmol C / hr) ──
+            'c_consumed': torch.zeros(bs, device=device),
+            'oxic_c': torch.zeros(bs, device=device),
+            'den1_c': torch.zeros(bs, device=device),
+            'den2_c': torch.zeros(bs, device=device),
+            'den3_c': torch.zeros(bs, device=device),
+            # ── full-domain carbon pathways (mmol C / hr) ──
+            'c_consumed_domain': torch.zeros(bs, device=device),
+            'oxic_c_domain': torch.zeros(bs, device=device),
+            'den1_c_domain': torch.zeros(bs, device=device),
+            'den2_c_domain': torch.zeros(bs, device=device),
+            'den3_c_domain': torch.zeros(bs, device=device),
+            'o2_flux_in': torch.zeros(bs, device=device),
+            'no3_flux_in': torch.zeros(bs, device=device),
+            'doc_leakage': torch.zeros(bs, device=device)
+        }
 
     # Pre-compute particle cell count for resp-rate normalisation
     n_core_cells = particle_mask.sum(dim=(-2, -1))  # [bs]
@@ -226,6 +248,63 @@ def run_simulation(state, cfg, device):
 
             fuel_history_b.append((current_time, total_fuel))
 
+            # ────────────────────────────────────────────────────────────
+            # NEW: Snapshot steady-state fluxes while actively anoxic
+            # ────────────────────────────────────────────────────────────
+            active_idx = torch.where(is_anoxic_b & ~is_extrapolated_b)[0]
+            if len(active_idx) > 0:
+                def integ(field, use_mask=False):
+                    val = field[active_idx]
+                    if use_mask:
+                        val = val * particle_mask[active_idx]
+                    return (val * dV_t[active_idx]).sum(dim=(-2, -1))
+                
+                c_rate = diags['RemOx_C'] + diags['RemDen1_C'] + diags['RemDen2_C'] + diags['RemDen3_C']
+
+                # ── core-only carbon pathways ──────────────────────────────────
+                steady_rates_dict['c_consumed'][active_idx]   = integ(c_rate, use_mask=True) * 3600.0
+                steady_rates_dict['oxic_c'][active_idx]       = integ(diags['RemOx_C'],   use_mask=True) * 3600.0
+                steady_rates_dict['den1_c'][active_idx]       = integ(diags['RemDen1_C'], use_mask=True) * 3600.0
+                steady_rates_dict['den2_c'][active_idx]       = integ(diags['RemDen2_C'], use_mask=True) * 3600.0
+                steady_rates_dict['den3_c'][active_idx]       = integ(diags['RemDen3_C'], use_mask=True) * 3600.0
+
+                # ── full-domain carbon pathways ────────────────────────────────
+                steady_rates_dict['c_consumed_domain'][active_idx] = integ(c_rate) * 3600.0
+                steady_rates_dict['oxic_c_domain'][active_idx]     = integ(diags['RemOx_C'])   * 3600.0
+                steady_rates_dict['den1_c_domain'][active_idx]     = integ(diags['RemDen1_C']) * 3600.0
+                steady_rates_dict['den2_c_domain'][active_idx]     = integ(diags['RemDen2_C']) * 3600.0
+                steady_rates_dict['den3_c_domain'][active_idx]     = integ(diags['RemDen3_C']) * 3600.0
+
+                # ── N2O ───────────────────────────────────────────────────────
+                steady_rates_dict['n2o_internal'][active_idx] = integ(ddt['n2o'], use_mask=True) * 3600.0
+                steady_rates_dict['n2o_flux_out'][active_idx] = integ(ddt['n2o']) * 3600.0
+                steady_rates_dict['n2_flux_out'][active_idx]  = integ(ddt['n2']) * 3600.0
+
+                o2_cons  = torch.where(ddt['o2']  < 0, ddt['o2'],  torch.zeros_like(ddt['o2']))
+                no3_cons = torch.where(ddt['no3'] < 0, ddt['no3'], torch.zeros_like(ddt['no3']))
+                steady_rates_dict['o2_flux_in'][active_idx]   = integ(torch.abs(o2_cons), use_mask=True) * 3600.0
+                steady_rates_dict['no3_flux_in'][active_idx]  = integ(torch.abs(no3_cons), use_mask=True) * 3600.0
+
+                doc_prod_core = integ(doc_flux_t.expand_as(particle_mask), use_mask=True)
+                doc_cons_core = integ(torch.abs(ddt['doc']), use_mask=True)
+                steady_rates_dict['doc_leakage'][active_idx]  = (doc_prod_core - doc_cons_core) * 3600.0
+
+                # ── resp_rate: direct SMS sum (RemOx+Den1+Den2+Den3) inside core,
+                #    divided by core volume → nmol C mm⁻³ hr⁻¹
+                #    This is more accurate than fuel-depletion slope because it
+                #    measures actual microbial DOC consumption, not POC decay. ──
+                c_consumed_core_mmol_hr = integ(c_rate, use_mask=True) * 3600.0  # mmol C / hr
+                core_vol_m3 = n_core_cells[active_idx].float() \
+                              * torch.tensor(dx_np[active_idx.cpu() if dx_np.shape[0] > 1 else [0]].reshape(-1),
+                                             dtype=torch.float32, device=device) \
+                              * torch.tensor(dy_np[active_idx.cpu() if dy_np.shape[0] > 1 else [0]].reshape(-1),
+                                             dtype=torch.float32, device=device) \
+                              * 1e-9  # mm² → m²; 1mm depth assumed; → m³
+                # mmol C / hr / m³  →  nmol C / mm³ / hr  (1 mmol/m³ = 1e-3 nmol/mm³)
+                steady_rates_dict['resp_rate'][active_idx] = \
+                    c_consumed_core_mmol_hr / core_vol_m3 * 1e-3
+            # ────────────────────────────────────────────────────────────
+
             if len(fuel_history_b) > 5:
                 fuel_history_b.pop(0)
 
@@ -246,17 +325,31 @@ def run_simulation(state, cfg, device):
                         rem_fuel = f1[idx]
                         b_rate   = burn_rates[idx]
 
-                        time_to_empty = rem_fuel / b_rate
-                        total_anoxia_sec = (current_time - anoxia_onset_b[idx]) + time_to_empty
+                        # time_to_empty = rem_fuel / b_rate
+                        # total_anoxia_sec = (current_time - anoxia_onset_b[idx]) + time_to_empty
+
+                        k_decay = (b_rate / rem_fuel).item()
+                        c_rate_ss = steady_rates_dict['c_consumed'][idx].item()
+                        o2_flux_ss = steady_rates_dict['o2_flux_in'][idx].item()
+                        
+                        # Anoxia ends when Respiration drops below O2 Diffusion
+                        if c_rate_ss > o2_flux_ss and o2_flux_ss > 1e-9:
+                            time_to_oxic = (1.0 / k_decay) * np.log(c_rate_ss / o2_flux_ss)
+                        elif o2_flux_ss <= 1e-9:
+                            time_to_oxic = (rem_fuel / b_rate).item() # Bound to absolute zero
+                        else:
+                            time_to_oxic = 0.0 # Already oxic!
+
+                        total_anoxia_sec = (current_time - anoxia_onset_b[idx]) + time_to_oxic
                         
                         final_durations_b[idx] = total_anoxia_sec / 3600.0
 
-                        # Resp rate calculation matched to exact original math
+                        # final_rates_b is legacy (used by terminal_snapshot_only path).
+                        # resp_rate is now set above from the direct SMS sum.
                         core_vol_m3 = n_core_cells[idx].item() * float(dx_np[idx if dx_np.shape[0]>1 else 0, 0, 0]) \
                                       * float(dy_np[idx if dy_np.shape[0]>1 else 0, 0, 0]) * 1e-9
                         rate_mmol_m3_s = b_rate.item() / core_vol_m3
-                        rate_nmol_mm3_hr = rate_mmol_m3_s * 3600.0 / 1000.0
-                        final_rates_b[idx] = rate_nmol_mm3_hr
+                        final_rates_b[idx] = rate_mmol_m3_s * 3600.0 / 1000.0
 
                     is_extrapolated_b[ready] = True
                     print(f"\n  ↳ Extrapolated {len(ready_idx)} particle(s) at t={current_time:.1f}s")
@@ -329,8 +422,14 @@ def run_simulation(state, cfg, device):
                 else:
                     final_rates_b[idx] = 0.0
 
-        return final_durations_b.cpu().numpy().tolist(), final_rates_b.cpu().numpy().tolist()
-
+        # Return extrapolated dictionary if requested
+        if getattr(cfg, 'extrapolate_steady_state', False):
+            final_dict = {k: v.cpu().numpy().tolist() for k, v in steady_rates_dict.items()}
+            return final_durations_b.cpu().numpy().tolist(), final_dict
+            
+        # OLD: Original return to keep run_suite_project.py safe
+        if getattr(cfg, 'terminal_snapshot_only', False):
+            return final_durations_b.cpu().numpy().tolist(), final_rates_b.cpu().numpy().tolist()
     # ── Normal run: finalise and return snapshots ─────────────────────────────
     if acc_steps > 0:
         acc['anoxic_core_frac_sum'] /= acc_steps

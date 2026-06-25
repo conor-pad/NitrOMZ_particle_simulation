@@ -8,7 +8,9 @@ radius = 2.55
 # ── Domain (Scaled by radius) ─────────────────────────────────────────────────
 Lx = 20.0 * radius  
 Ly = 10 * radius  
-Nx, Ny = int(351), int(307)
+# Nx, Ny = int(351), int(307)
+# Nx, Ny = int(245), int(201)
+Nx, Ny = 116, 101  
 dx = Lx / (Nx - 1)
 dy = Ly / (Ny - 1)
 cx = 5.0 * radius   
@@ -31,7 +33,7 @@ Re_actual = (U_bg * (2.0 * radius)) / nu
 Pe_calc = Re_actual * Sc_target  
 
 # Calculate total time based on 5x the domain length
-Total_Time = 200.0 
+Total_Time = 600.0 
 
 terminal_snapshot_only = False
 
